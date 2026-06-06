@@ -1,6 +1,8 @@
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+import pybullet as p
+import pybullet_data
 
 
 class DroneLevitationEnv(gym.Env):
@@ -23,6 +25,20 @@ class DroneLevitationEnv(gym.Env):
         )
 
         self.render_mode = render_mode
+        self.target_height = 0.5  # meters
+
+        # PyBullet setup
+        if render_mode == "human":
+            self.physics_client = p.connect(p.GUI)
+        else:
+            self.physics_client = p.connect(p.DIRECT)  # headless, faster for training
+
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.81)
+
+        # placeholders, will be loaded in reset()
+        self.plane_id = None
+        self.drone_id = None
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -42,4 +58,4 @@ class DroneLevitationEnv(gym.Env):
         pass
 
     def close(self):
-        pass
+        p.disconnect(self.physics_client)
