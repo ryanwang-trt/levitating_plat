@@ -40,9 +40,53 @@ class DroneLevitationEnv(gym.Env):
         self.plane_id = None
         self.drone_id = None
 
+    def _get_obs(self):
+        # Position and orientation (quaternion) of the drone
+        pos, orn = p.getBasePositionAndOrientation(self.drone_id)
+        # Linear and angular velocity
+        lin_vel, ang_vel = p.getBaseVelocity(self.drone_id)
+
+        # Convert quaternion → euler angles (roll, pitch, yaw)
+        roll, pitch, yaw = p.getEulerFromQuaternion(orn)
+
+        height = pos[2]          # z position
+        vz = lin_vel[2]          # vertical velocity
+        roll_rate = ang_vel[0]   # angular velocity around x
+        pitch_rate = ang_vel[1]  # angular velocity around y
+
+        obs = np.array([
+            height, vz, roll, pitch, roll_rate, pitch_rate
+        ], dtype=np.float32)
+        return obs
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        obs = np.zeros(6, dtype=np.float32)
+
+        p.resetSimulation()
+        p.setGravity(0, 0, -9.81)
+
+        # Ground plane
+        self.plane_id = p.loadURDF("plane.urdf")
+
+        # Create the platform as a simple box (no URDF file needed)
+        half_extents = [0.15, 0.15, 0.02]   # 30cm x 30cm x 4cm platform
+
+        # Collision and Visualization
+        col_id = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
+        vis_id = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents,
+                                    rgbaColor=[0.2, 0.4, 0.8, 1])
+
+        start_pos = [0, 0, self.target_height]
+        start_orientation = p.getQuaternionFromEuler([0, 0, 0])
+        self.drone_id = p.createMultiBody(
+            baseMass=1.0,                       # 1 kg platform
+            baseCollisionShapeIndex=col_id,
+            baseVisualShapeIndex=vis_id,
+            basePosition=start_pos,
+            baseOrientation=start_orientation,
+        )
+
+        obs = self._get_obs()
         info = {}
         return obs, info
 

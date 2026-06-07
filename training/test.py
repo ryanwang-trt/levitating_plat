@@ -1,5 +1,8 @@
 from env import DroneLevitationEnv
+import time
 
 env = DroneLevitationEnv(render_mode="human")
-print("success")
+obs, info = env.reset()
+print("obs:", obs)
+
 env.close()
