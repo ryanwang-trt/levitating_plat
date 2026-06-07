@@ -61,7 +61,7 @@ class DroneLevitationEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-
+        
         p.resetSimulation()
         p.setGravity(0, 0, -9.81)
 
@@ -86,15 +86,64 @@ class DroneLevitationEnv(gym.Env):
             baseOrientation=start_orientation,
         )
 
+        self.step_count = 0
+
         obs = self._get_obs()
         info = {}
         return obs, info
 
     def step(self, action):
-        obs = np.zeros(6, dtype=np.float32)
+        # ---- 0. Clip action into valid [0, 1] range ----
+        # PPO's Gaussian policy can sample outside the action_space bounds
+        # (especially early in training), which would otherwise produce
+        # negative thrust or more than max thrust.
+        action = np.clip(action, 0.0, 1.0)
+
+        # ---- 1. Convert action [0~1] × 4 into upward forces at 4 corners ----
+        # Hover force: platform mass (1kg) × gravity (9.81) = 9.81N total to hold still
+        # Split across 4 motors, and let max thrust be ~2× hover so it can climb
+        max_thrust_per_motor = (1.0 * 9.81 / 4) * 2.0   # ~4.9 N per motor at full throttle
+
+        # 4 corners coordinates of the platform (matches half_extents 0.15 x 0.15)
+        corners = [
+            [ 0.15,  0.15, 0],
+            [-0.15,  0.15, 0],
+            [-0.15, -0.15, 0],
+            [ 0.15, -0.15, 0],
+        ]
+
+        for i in range(4):
+            thrust = float(action[i]) * max_thrust_per_motor # 0~1 → 0~max Newtons
+            force = [0, 0, thrust] # straight up 
+            p.applyExternalForce(
+                self.drone_id,
+                -1,                       # -1 = apply to base body
+                forceObj=force,           # amount of force applied
+                posObj=corners[i],        # at this corner
+                flags=p.LINK_FRAME,       # relative to platform's own orientation
+            )
+
+        # ---- 2. Step the physics forward ----
+        p.stepSimulation()
+
+        # ---- 3. Read the new state ----
+        obs = self._get_obs()
+
+        # ---- 4. Reward (placeholder for now) ----
         reward = 0.0
-        terminated = False
-        truncated = False
+
+        # ---- 5. Episode termination ----
+        height = obs[0]
+        roll, pitch = obs[2], obs[3]
+        max_tilt = np.deg2rad(80)   # tipped over at 80 deg
+        terminated = bool(
+            height < 0.05 or height > 2.5            # crashed or flew too high
+            or abs(roll) > max_tilt or abs(pitch) > max_tilt  # tipped over
+        )
+
+        self.step_count += 1
+        truncated = bool(self.step_count >= 1000)          # max episode length
+
         info = {}
         return obs, reward, terminated, truncated, info
 
