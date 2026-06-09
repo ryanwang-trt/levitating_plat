@@ -14,3 +14,11 @@ reward:
     enabled: false
     weight: 10.0
     # target_height: 0.5   # defaults to env.target_height if omitted
+
+training:
+  total_timesteps: 20000
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  seed: 0
+  save_path: "models/policy_v1"
