@@ -1,0 +1,16 @@
+# Tunable parameters for the levitating platform training pipeline.
+
+reward:
+  # Core Free Float terms: keep the platform alive, level, and still.
+  w_tilt: 5.0        # penalty on |roll| + |pitch|
+  w_vz: 2.0          # penalty on |vz|
+  w_ang_rate: 1.0    # penalty on |roll_rate| + |pitch_rate|
+  w_energy: 0.1      # penalty on sum(action**2)
+  alive_bonus: 1.0   # per-step reward for not terminating
+
+  # Optional height-hold term: flip enabled -> true to switch to hybrid mode
+  # (Free Float + station keeping) without touching any code.
+  height_hold:
+    enabled: false
+    weight: 10.0
+    # target_height: 0.5   # defaults to env.target_height if omitted

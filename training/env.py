@@ -4,12 +4,20 @@ from gymnasium import spaces
 import pybullet as p
 import pybullet_data
 
+from reward import compute_reward
+
 
 class DroneLevitationEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 60}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, config=None):
         super().__init__()
+
+        # Reward config (the "reward" section of config.yaml). Read once here so
+        # step() doesn't re-parse it every tick. Empty dict -> compute_reward uses
+        # its built-in Free Float defaults.
+        config = config or {}
+        self.reward_cfg = config.get("reward", {})
 
         #The observation space is defined as height，vz (vertical speed) from ToF
         #                                    roll （side tilt), pitch(front tilt), roll_rate, pitch_rate
@@ -129,8 +137,8 @@ class DroneLevitationEnv(gym.Env):
         # ---- 3. Read the new state ----
         obs = self._get_obs()
 
-        # ---- 4. Reward (placeholder for now) ----
-        reward = 0.0
+        # ---- 4. Reward (Method B Free Float, see reward.py) ----
+        reward = compute_reward(obs, action, self.reward_cfg, self.target_height)
 
         # ---- 5. Episode termination ----
         height = obs[0]
