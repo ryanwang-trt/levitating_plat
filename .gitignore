@@ -1,0 +1,18 @@
+# 在 levitating_plat 根目录
+cat >> .gitignore << 'EOF'
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Training artifacts (临时模型，发布的预训练模型单独 add)
+*.zip
+runs/
+logs/
+EOF

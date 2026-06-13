@@ -15,6 +15,20 @@ reward:
     weight: 10.0
     # target_height: 0.5   # defaults to env.target_height if omitted
 
+hardware:
+  # Target board: Raspberry Pi 5 (migrated off Jetson).
+  # Pin numbers use the BCM GPIO numbering scheme (what pigpio / gpiozero /
+  # lgpio expect by default), NOT physical board pin numbers.
+  #
+  # motor_pins: one BCM GPIO per motor, in motor order [0, 1, 2, 3].
+  # On the Pi 5 these four lines all expose hardware PWM, so they map
+  # cleanly to four PWM-driven ESCs/motors with no software PWM jitter.
+  motor_pins: [12, 13, 18, 19]
+
+  # I2C bus for the IMU / sensors. The Pi 5 exposes user-space I2C on
+  # bus 1 (/dev/i2c-1, header pins 3/5 = GPIO2/GPIO3).
+  i2c_bus: 1
+
 training:
   total_timesteps: 20000
   learning_rate: 0.0003
