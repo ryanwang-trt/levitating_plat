@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import EvalCallback
 
 from env import DroneLevitationEnv
 
@@ -41,6 +42,30 @@ def main(timesteps_override=None):
     # Monitor tracks episode returns/lengths so PPO prints rollout/ep_rew_mean.
     env = Monitor(env)
 
+    # Separate eval env: same config (keeps domain_randomization on), but every
+    # evaluation is seeded identically so the disturbance sequence is fixed.
+    # A new high score then means the policy genuinely recovers better, not that
+    # it drew easier initial conditions.
+    eval_env = Monitor(DroneLevitationEnv(config=config))
+    # Seed the eval env's RNG once. Gymnasium dropped Env.seed(); seeding goes
+    # through reset(seed=...), which initializes self.np_random. EvalCallback's
+    # later reset() calls pass no seed, so the RNG continues deterministically
+    # from this seeded stream -> a fixed disturbance sequence across evaluations.
+    eval_env.reset(seed=seed)
+
+    # EvalCallback evaluates the current policy every eval_freq steps and saves
+    # best_model.zip only when the mean eval reward sets a new high. So however
+    # training ends, models/best_model.zip is the best policy seen over the run.
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=str(save_path.parent),  # -> models/best_model.zip
+        log_path=str(save_path.parent),
+        eval_freq=25_000,
+        n_eval_episodes=10,
+        deterministic=True,
+        render=False,
+    )
+
     model = PPO(
         "MlpPolicy",
         env,
@@ -53,11 +78,14 @@ def main(timesteps_override=None):
         tensorboard_log=str(SCRIPT_DIR / "tb_logs"),
     )
 
-    model.learn(total_timesteps=total_timesteps)
+    model.learn(total_timesteps=total_timesteps, callback=eval_callback)
     model.save(str(save_path))
     print(f"saved model to {save_path}.zip")
+    print(f"best model (highest eval reward) saved to "
+          f"{save_path.parent / 'best_model'}.zip")
 
     env.close()
+    eval_env.close()
 
 
 if __name__ == "__main__":

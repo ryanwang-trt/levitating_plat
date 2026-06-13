@@ -15,6 +15,16 @@ reward:
     weight: 10.0
     # target_height: 0.5   # defaults to env.target_height if omitted
 
+# Initial-condition randomization applied in env.reset(). This is what forces
+# the policy to LEARN recovery: every episode starts off-nominal (falling/rising,
+# tilted, and tumbling) and must pull itself back into a free float. Affects both
+# training and eval. Set enabled: false to restore the old perfect-start behavior.
+domain_randomization:
+  enabled: true
+  vz_range: 1.0          # initial vertical speed sampled from [-vz_range, +vz_range] m/s
+  tilt_range_deg: 15.0   # initial roll & pitch each sampled from [-tilt, +tilt] degrees
+  ang_rate_range: 1.0    # initial roll_rate & pitch_rate each from [-r, +r] rad/s
+
 hardware:
   # Target board: Raspberry Pi 5 (migrated off Jetson).
   # Pin numbers use the BCM GPIO numbering scheme (what pigpio / gpiozero /
@@ -30,7 +40,7 @@ hardware:
   i2c_bus: 1
 
 training:
-  total_timesteps: 20000
+  total_timesteps: 1000000
   learning_rate: 0.0003
   n_steps: 2048
   batch_size: 64

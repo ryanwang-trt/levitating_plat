@@ -19,6 +19,11 @@ class DroneLevitationEnv(gym.Env):
         config = config or {}
         self.reward_cfg = config.get("reward", {})
 
+        # Domain randomization config (the "domain_randomization" section). Read
+        # once here so reset() doesn't re-parse it each episode. When disabled (or
+        # absent) reset() starts the platform from the old perfect, still state.
+        self.dr_cfg = config.get("domain_randomization", {}) or {}
+
         #The observation space is defined as height，vz (vertical speed) from ToF
         #                                    roll （side tilt), pitch(front tilt), roll_rate, pitch_rate
         self.observation_space = spaces.Box(
@@ -84,14 +89,40 @@ class DroneLevitationEnv(gym.Env):
         vis_id = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents,
                                     rgbaColor=[0.2, 0.4, 0.8, 1])
 
+        # ---- Sample initial disturbance (domain randomization) ----
+        # Every episode starts off-nominal so the policy must LEARN to recover
+        # into a free float rather than just holding a perfect hover. Disabled
+        # -> all-zero disturbance, i.e. the old perfect, still start.
+        if self.dr_cfg.get("enabled", False):
+            tilt = np.deg2rad(self.dr_cfg.get("tilt_range_deg", 15.0))
+            vz_r = self.dr_cfg.get("vz_range", 1.0)
+            ang_r = self.dr_cfg.get("ang_rate_range", 1.0)
+
+            init_roll = self.np_random.uniform(-tilt, tilt)
+            init_pitch = self.np_random.uniform(-tilt, tilt)
+            init_vz = self.np_random.uniform(-vz_r, vz_r)
+            init_roll_rate = self.np_random.uniform(-ang_r, ang_r)
+            init_pitch_rate = self.np_random.uniform(-ang_r, ang_r)
+        else:
+            init_roll = init_pitch = 0.0
+            init_vz = 0.0
+            init_roll_rate = init_pitch_rate = 0.0
+
         start_pos = [0, 0, self.target_height]
-        start_orientation = p.getQuaternionFromEuler([0, 0, 0])
+        start_orientation = p.getQuaternionFromEuler([init_roll, init_pitch, 0])
         self.drone_id = p.createMultiBody(
             baseMass=1.0,                       # 1 kg platform
             baseCollisionShapeIndex=col_id,
             baseVisualShapeIndex=vis_id,
             basePosition=start_pos,
             baseOrientation=start_orientation,
+        )
+
+        # Apply the sampled initial velocities (createMultiBody starts at rest).
+        p.resetBaseVelocity(
+            self.drone_id,
+            linearVelocity=[0, 0, init_vz],
+            angularVelocity=[init_roll_rate, init_pitch_rate, 0],
         )
 
         self.step_count = 0
