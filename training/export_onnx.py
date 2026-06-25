@@ -19,11 +19,16 @@ OBS_DIM = 6   # [height, vz, roll, pitch, roll_rate, pitch_rate]
 ACTION_DIM = 4  # [m1, m2, m3, m4]
 
 
-def load_save_path():
-    """Read training.save_path from config so we load the model train.py wrote."""
+def load_default_model_path():
+    """Default model to export: the best checkpoint of the configured stage.
+
+    Reads training.stage from config and returns models/<stage>/best, matching
+    the layout train.py writes (best.zip = highest-eval-reward checkpoint).
+    """
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f) or {}
-    return config.get("training", {}).get("save_path", "models/policy_v1")
+    stage = config.get("training", {}).get("stage", "stage1")
+    return f"models/{stage}/best"
 
 
 class DeterministicActor(torch.nn.Module):
@@ -56,7 +61,7 @@ class DeterministicActor(torch.nn.Module):
 
 def export(model_path=None, onnx_path=None):
     if model_path is None:
-        model_path = SCRIPT_DIR / load_save_path()
+        model_path = SCRIPT_DIR / load_default_model_path()
     if onnx_path is None:
         onnx_path = SCRIPT_DIR / "policy.onnx"
 
@@ -136,7 +141,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default=None,
-        help="path to the trained model .zip (defaults to training.save_path)",
+        help="path to the trained model .zip (defaults to models/<training.stage>/best)",
     )
     parser.add_argument(
         "--out",

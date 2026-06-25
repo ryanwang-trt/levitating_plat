@@ -92,6 +92,31 @@ def test_height_hold_target_falls_back_to_config_value():
     assert r == pytest.approx(1.0)
 
 
+def test_attitude_grace_waives_tilt_and_ang_rate():
+    # Tilted AND spinning. With grace on, tilt + ang_rate penalties are waived;
+    # only alive_bonus, vz, and energy remain. Here vz=0, action=0 -> reward 1.0.
+    obs = [0.5, 0.0, 0.3, -0.2, 0.4, -0.1]   # off-level + tumbling
+    full = compute_reward(obs, ZERO_ACTION)                       # penalties apply
+    graced = compute_reward(obs, ZERO_ACTION, attitude_grace=True)
+    assert full < graced                       # grace removes penalty -> higher
+    assert graced == pytest.approx(1.0)        # only alive bonus left
+
+
+def test_attitude_grace_keeps_vz_and_energy_penalties():
+    # Grace waives ONLY attitude (tilt/ang_rate). vz and energy must still bite,
+    # so the policy can't thrash the throttle or rocket vertically for free.
+    # vz=0.5 -> -w_vz*0.5 = -1.0 ; action 0.5 -> -w_energy*1.0 = -0.1
+    obs = [0.5, 0.5, 0.3, -0.2, 0.4, -0.1]
+    r = compute_reward(obs, [0.5, 0.5, 0.5, 0.5], attitude_grace=True)
+    assert r == pytest.approx(1.0 - 1.0 - 0.1)
+
+
+def test_attitude_grace_default_off():
+    # Default (no flag) must keep the old behavior: penalties apply.
+    obs = [0.5, 0.0, 0.1, 0.0, 0.0, 0.0]       # tilt 0.1 -> -0.5
+    assert compute_reward(obs, ZERO_ACTION) == pytest.approx(0.5)
+
+
 def test_returns_python_float():
     r = compute_reward(PERFECT_OBS, ZERO_ACTION)
     assert isinstance(r, float)

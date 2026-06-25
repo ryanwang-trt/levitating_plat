@@ -123,3 +123,145 @@ def test_seeded_reset_is_reproducible():
         np.testing.assert_allclose(obs1, obs2)
     finally:
         e.close()
+
+
+def test_disturbance_injection_keeps_step_well_formed():
+    # Stage 2: with injection forced on every step (prob=1.0), step() must still
+    # return finite, correctly-shaped obs/reward and not crash. obs dimension is
+    # unchanged (disturbance is a physics-only effect).
+    cfg = {"disturbance_injection": {
+        "enabled": True, "prob": 1.0, "force_min": 2.0, "force_max": 8.0,
+    }}
+    e = DroneLevitationEnv(config=cfg)
+    try:
+        e.reset(seed=0)
+        hover = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+        for _ in range(50):
+            obs, reward, terminated, truncated, _ = e.step(hover)
+            assert obs.shape == (OBS_DIM,)
+            assert np.all(np.isfinite(obs))
+            assert np.isfinite(reward)
+            if terminated or truncated:
+                break
+    finally:
+        e.close()
+
+
+def test_disturbance_injection_off_by_default():
+    # No disturbance_injection config -> shoves never fire, so two seeded runs
+    # of the same action sequence stay identical (no hidden RNG draws for force).
+    e = DroneLevitationEnv()  # injection absent -> disabled
+    try:
+        e.reset(seed=7)
+        hover = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+        first = [e.step(hover)[0].copy() for _ in range(20)]
+        e.reset(seed=7)
+        second = [e.step(hover)[0].copy() for _ in range(20)]
+        for a, b in zip(first, second):
+            np.testing.assert_allclose(a, b)
+    finally:
+        e.close()
+
+
+def test_air_drag_damps_horizontal_velocity():
+    # With linear_damping > 0, a horizontal velocity must DECAY over free-float
+    # steps (no thrust asymmetry driving it). Without damping it persists. We kick
+    # the platform sideways and check vx shrinks more with damping than without.
+    import pybullet as p
+
+    def vx_after_kick(damping):
+        cfg = {"physics": {"linear_damping": damping, "angular_damping": 0.0}}
+        e = DroneLevitationEnv(config=cfg)
+        try:
+            e.reset(seed=0)
+            p.resetBaseVelocity(e.drone_id, linearVelocity=[1.0, 0.0, 0.0])
+            hover = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+            for _ in range(60):
+                e.step(hover)
+            return p.getBaseVelocity(e.drone_id)[0][0]
+        finally:
+            e.close()
+
+    vx_damped = vx_after_kick(1.0)
+    vx_undamped = vx_after_kick(0.0)
+    assert abs(vx_damped) < abs(vx_undamped)   # damping bleeds off more speed
+    assert abs(vx_damped) < 1.0                # clearly decayed from the 1.0 kick
+
+
+def test_disturbance_is_held_for_full_duration():
+    # A shove must be HELD for exactly duration frames with constant force/offset
+    # (a sustained push), not re-sampled each frame. prob=1.0 + duration 5..5
+    # forces one shove to start on step 1 and persist for 5 frames.
+    cfg = {"disturbance_injection": {
+        "enabled": True, "prob": 1.0,
+        "force_min": 10.0, "force_max": 10.0,
+        "duration_min": 5, "duration_max": 5,
+    }}
+    e = DroneLevitationEnv(config=cfg)
+    try:
+        e.reset(seed=0)
+        hover = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+
+        e.step(hover)  # step 1 starts the shove and applies frame 1 of 5
+        force_after_start = np.array(e._shove_force)
+        assert e._shove_remaining == 4, "shove should have 4 of 5 frames left"
+
+        # Next 4 frames keep the SAME force/offset and count down to 0.
+        for expected_left in (3, 2, 1, 0):
+            e.step(hover)
+            # Force must stay constant across the held shove (not re-sampled).
+            np.testing.assert_allclose(e._shove_force, force_after_start)
+            assert e._shove_remaining == expected_left
+    finally:
+        e.close()
+
+
+def test_reset_clears_in_progress_shove():
+    # A shove still in progress at reset() must not leak into the next episode.
+    cfg = {"disturbance_injection": {
+        "enabled": True, "prob": 1.0,
+        "force_min": 10.0, "force_max": 10.0,
+        "duration_min": 50, "duration_max": 50,
+    }}
+    e = DroneLevitationEnv(config=cfg)
+    try:
+        e.reset(seed=0)
+        e.step(np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32))
+        assert e._shove_remaining > 0, "a long shove should be mid-flight"
+        e.reset(seed=0)
+        assert e._shove_remaining == 0
+        assert e._shove_force is None
+        assert e._shove_offset is None
+        assert e._grace_remaining == 0
+    finally:
+        e.close()
+
+
+def test_grace_window_arms_on_shove_and_decays():
+    # A shove arms the attitude-penalty grace window to grace_frames; once the
+    # shove ends the window counts down on the following shove-free steps. We run
+    # a 2-frame shove (prob=1.0 fires it immediately), then zero prob so no new
+    # shove re-arms grace, and watch it decay to 0.
+    cfg = {"disturbance_injection": {
+        "enabled": True, "prob": 1.0,
+        "force_min": 6.0, "force_max": 6.0,
+        "duration_min": 2, "duration_max": 2,
+        "grace_frames": 4,
+    }}
+    e = DroneLevitationEnv(config=cfg)
+    try:
+        e.reset(seed=0)
+        hover = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+
+        e.step(hover)
+        e.step(hover)  # 2-frame shove now over; grace armed to 4, ticked once -> 3
+        assert e._shove_remaining == 0
+        assert e._grace_remaining == 3
+
+        # Stop new shoves so grace can decay cleanly, then count it down to 0.
+        e.dist_cfg["prob"] = 0.0
+        for expected in (2, 1, 0, 0):
+            e.step(hover)
+            assert e._grace_remaining == expected
+    finally:
+        e.close()

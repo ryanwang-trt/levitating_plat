@@ -1,7 +1,8 @@
 import numpy as np
 
 
-def compute_reward(obs, action, config=None, target_height=None):
+def compute_reward(obs, action, config=None, target_height=None,
+                   attitude_grace=False):
     """Method B (Free Float) reward.
 
     The platform is rewarded for staying alive, level, and still — but NOT for
@@ -12,6 +13,13 @@ def compute_reward(obs, action, config=None, target_height=None):
     action : [m1, m2, m3, m4] in [0, 1]
     config : the "reward" sub-dict from config.yaml. Missing keys fall back to
              the built-in defaults below, so a missing/empty config never crashes.
+    attitude_grace : when True (set by env during/just after a disturbance), the
+             tilt and ang_rate penalties are waived. The platform was knocked
+             off-level BY the shove, so charging it for that tilt teaches "die
+             early to stop the bleeding" rather than "recover". alive_bonus,
+             vz, and energy terms stay active so it still has a reason to live
+             and a cost for thrashing. Outside the grace window the full
+             attitude penalties resume, which is what rewards actual recovery.
     """
     cfg = config or {}
     obs = np.asarray(obs, dtype=np.float64)
@@ -27,9 +35,13 @@ def compute_reward(obs, action, config=None, target_height=None):
     w_energy = cfg.get("w_energy", 0.1)
 
     reward = alive_bonus
-    reward -= w_tilt * (abs(roll) + abs(pitch))                 # stay level
+    if not attitude_grace:
+        # Attitude penalties only outside the post-shove grace window — see the
+        # attitude_grace docstring. Inside the window these are skipped so the
+        # policy isn't charged for the tilt/spin the disturbance forced on it.
+        reward -= w_tilt * (abs(roll) + abs(pitch))                 # stay level
+        reward -= w_ang_rate * (abs(roll_rate) + abs(pitch_rate))  # suppress rotation
     reward -= w_vz * abs(vz)                                    # suppress vertical motion
-    reward -= w_ang_rate * (abs(roll_rate) + abs(pitch_rate))  # suppress rotation
     reward -= w_energy * float(np.sum(action ** 2))            # penalize throttle effort
 
     # ---- Optional height-hold term (off by default -> pure Free Float) ----

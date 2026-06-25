@@ -25,6 +25,80 @@ domain_randomization:
   tilt_range_deg: 15.0   # initial roll & pitch each sampled from [-tilt, +tilt] degrees
   ang_rate_range: 1.0    # initial roll_rate & pitch_rate each from [-r, +r] rad/s
 
+# Stage 2: in-flight disturbance injection (env.step()). With small per-step
+# probability a random all-directions external shove (incl. horizontal) starts,
+# applied off-center so it both pushes and tilts the platform, and is then HELD
+# for a random number of frames. Holding the force makes the *impulse* (force x
+# duration) the thing that varies — so this range must bracket whatever sustained
+# push you intend to demo/deploy against (see eval.py, which holds ~19 N for 30
+# frames). The platform must keep a level attitude and survive the full episode;
+# horizontal position/drift is NOT penalized or terminated — it may be pushed
+# anywhere as long as it stays level. Set enabled: false to disable.
+#
+# Impulse coverage (PyBullet dt = 1/240 s):
+#   min: force_min * duration_min / 240 = 4 * 1  / 240 ≈  17 mN·s (single-frame tap)
+#   max: force_max * duration_max / 240 = 20 * 40 / 240 ≈ 3333 mN·s (long hard shove)
+#   eval's ~19 N x 30 frames ≈ 2400 mN·s sits at ~72% of this range — inside it.
+disturbance_injection:
+  enabled: true
+  # prob is the probability of STARTING a new shove on a step where none is in
+  # progress (it is not re-rolled mid-shove). Lowered from 0.015 because each
+  # shove now occupies up to duration_max frames instead of one.
+  prob: 0.01
+  # Default force/duration (= curriculum stage 1). train.py --dist-stage {1,2,3}
+  # overrides these from disturbance_stages below for the 3-stage curriculum.
+  force_min: 4.0          # shove magnitude sampled from [force_min, force_max] N
+  force_max: 8.0
+  duration_min: 1         # shove held for a random [duration_min, duration_max]
+  duration_max: 10        # frames (1/240 s each): 40 frames ≈ 167 ms sustained push
+  # Post-shove reward grace: tilt/ang_rate penalties are waived during a shove
+  # and for this many frames after it ends, so the policy isn't punished for the
+  # tilt the shove forced on it (only for failing to recover once grace ends).
+  # Without this the per-step penalty (~-8) dwarfs alive_bonus (+1) and the
+  # policy learns to terminate early instead of recovering. 0 -> no grace.
+  #
+  # Note on duty cycle: a shove re-arms grace to grace_frames on every frame it's
+  # active, so grace stays open for the whole shove + grace_frames after. The
+  # grace duty cycle was suspected of causing ep_len collapse at stage2/3, but a
+  # diagnostic disproved it: of 13 tip-over terminations, 0 occurred during the
+  # grace window — they all happen in free float after grace ends. The real cause
+  # is residual horizontal momentum from a shove (unobservable + under-damped at
+  # higher forces), not grace. So grace_frames stays at 60 (enough post-shove
+  # slack); shrinking it only made reward look worse without fixing tip-overs.
+  grace_frames: 60        # ~0.25 s of recovery slack after a shove
+
+# 2-stage disturbance curriculum (force + duration ramp up). Select a stage with
+# train.py --dist-stage {1,2}; it overrides disturbance_injection.force_*/
+# duration_* with the chosen stage. Fine-tune the chain: stage 1 from stage1/best,
+# stage 2 from stage 1's best. prob/grace are shared (from disturbance_injection
+# above), force/duration AND damping (linear_damping below) change per stage.
+#
+# A 3rd stage (8-15 N, dur 30) was dropped: at that force the residual horizontal
+# momentum needs linear_damping ~2.0 to keep the platform from tipping, but 2.0
+# is far stiffer than the real air drag on a 30 cm platform — training against it
+# would teach a sim-to-real crutch. We cap damping at 1.0 (still plausible) and
+# stop the curriculum at stage 2, which 1.0 damping handles cleanly (0/30 tips).
+disturbance_stages:
+  - {force_min: 4.0,  force_max: 8.0,  duration_min: 1, duration_max: 10, linear_damping: 0.5}   # stage 1
+  - {force_min: 6.0,  force_max: 12.0, duration_min: 1, duration_max: 20, linear_damping: 1.0}   # stage 2
+
+# Air drag, applied in env.reset() via PyBullet changeDynamics. PyBullet bodies
+# are undamped by default, so horizontal velocity from a shove never decays and
+# the platform drifts forever — that residual momentum (invisible to the policy:
+# vx/vy aren't in obs and can't be measured on the real hardware) destabilizes
+# it ~150 frames after a push. A real platform moving through air feels drag
+# that bleeds this off; modeling it lets the policy stay stable on IMU-only obs.
+# This is the DEFAULT damping (used by eval, and by training runs with no
+# --dist-stage). Per-stage curriculum runs override it from disturbance_stages
+# (stage 1 -> 0.5, stage 2 -> 1.0). Set to 1.0 here so eval matches the hardest
+# trained stage and the demo is honest. Sweep showed stage2 (6-12 N) tips 13/30
+# at damp 0.5 but 0/30 at damp 1.0; the real horizontal momentum a shove leaves
+# behind is what destabilizes the platform (vx/vy aren't observable), and 1.0 is
+# the cap we judged still plausible for real air drag. Affects training/eval/tests.
+physics:
+  linear_damping: 1.0
+  angular_damping: 1.0
+
 hardware:
   # Target board: Raspberry Pi 5 (migrated off Jetson).
   # Pin numbers use the BCM GPIO numbering scheme (what pigpio / gpiozero /
@@ -45,4 +119,6 @@ training:
   n_steps: 2048
   batch_size: 64
   seed: 0
-  save_path: "models/policy_v1"
+  # Run name. Artifacts land in models/<stage>/{final,best}.zip + evaluations.npz.
+  # Override per-run with `python train.py --stage stage2` (e.g. for a fine-tune).
+  stage: "stage1"

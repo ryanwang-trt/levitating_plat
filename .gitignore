@@ -1,5 +1,3 @@
-# 在 levitating_plat 根目录
-cat >> .gitignore << 'EOF'
 # Virtual environments
 .venv/
 venv/
@@ -13,6 +11,9 @@ __pycache__/
 
 # Training artifacts (临时模型，发布的预训练模型单独 add)
 *.zip
+training/models/
+training/tb_logs/
 runs/
 logs/
-EOF
+
+.ps1

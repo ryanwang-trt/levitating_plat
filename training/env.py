@@ -24,6 +24,36 @@ class DroneLevitationEnv(gym.Env):
         # absent) reset() starts the platform from the old perfect, still state.
         self.dr_cfg = config.get("domain_randomization", {}) or {}
 
+        # Stage 2: in-flight disturbance injection (the "disturbance_injection"
+        # section). Each step has a small probability of triggering a random
+        # external shove that is then HELD for a random number of frames (so the
+        # training impulse range covers a sustained push, not just a single-frame
+        # tap). Read once here so step() doesn't re-parse it every tick. Disabled
+        # (or absent) -> no shoves, i.e. plain Free Float physics.
+        self.dist_cfg = config.get("disturbance_injection", {}) or {}
+
+        # Physics config (the "physics" section): air drag (linear/angular
+        # damping). Read once here so reset() doesn't re-parse it each episode.
+        # Absent/0 -> undamped (the old behavior).
+        self.phys_cfg = config.get("physics", {}) or {}
+
+        # Post-shove reward grace window. While a shove is active AND for this
+        # many frames after it ends, the attitude penalties (tilt + ang_rate) are
+        # waived in compute_reward — being knocked off-level is the disturbance's
+        # doing, not the policy's, so we don't punish the policy for *being* hit;
+        # we only resume penalizing once the grace window expires, which is what
+        # rewards actually RECOVERING. alive_bonus + energy stay active throughout
+        # so "die early to stop the bleeding" is no longer the optimal move.
+        # 0 -> no grace (old behavior). Reset per episode.
+        self._grace_frames = int(self.dist_cfg.get("grace_frames", 0))
+        self._grace_remaining = 0           # frames of attitude-penalty grace left
+
+        # State for an in-progress sustained shove (set on trigger, decremented
+        # each frame until it expires). Reset per episode in reset().
+        self._shove_remaining = 0           # frames left in the current shove
+        self._shove_force = None            # [fx, fy, fz] held constant this shove
+        self._shove_offset = None           # application point, held constant
+
         #The observation space is defined as height，vz (vertical speed) from ToF
         #                                    roll （side tilt), pitch(front tilt), roll_rate, pitch_rate
         self.observation_space = spaces.Box(
@@ -118,6 +148,22 @@ class DroneLevitationEnv(gym.Env):
             baseOrientation=start_orientation,
         )
 
+        # Air drag. PyBullet bodies are undamped by default, so any horizontal
+        # velocity a shove imparts NEVER decays — the platform drifts at constant
+        # speed forever, and that residual momentum (invisible to the policy:
+        # vx/vy aren't in obs and can't be measured on the real hardware)
+        # eventually destabilizes it ~150 frames after a push. A real platform of
+        # this size moving through air feels drag that bleeds that momentum off;
+        # modeling it lets the policy stay stable on IMU-only obs (attitude +
+        # rates + vz), exactly what it has on hardware. 0 -> undamped.
+        lin_damp = float(self.phys_cfg.get("linear_damping", 0.0))
+        ang_damp = float(self.phys_cfg.get("angular_damping", 0.0))
+        p.changeDynamics(
+            self.drone_id, -1,
+            linearDamping=lin_damp,
+            angularDamping=ang_damp,
+        )
+
         # Apply the sampled initial velocities (createMultiBody starts at rest).
         p.resetBaseVelocity(
             self.drone_id,
@@ -127,9 +173,38 @@ class DroneLevitationEnv(gym.Env):
 
         self.step_count = 0
 
+        # Clear any in-progress sustained shove so it doesn't leak across episodes.
+        self._shove_remaining = 0
+        self._shove_force = None
+        self._shove_offset = None
+        self._grace_remaining = 0
+
         obs = self._get_obs()
         info = {}
         return obs, info
+
+    def _apply_disturbance(self, force, offset):
+        """Inject one external shove on the platform.
+
+        force  : [fx, fy, fz] in the platform's LINK frame (Newtons). Both force
+                 and application point are in the link frame so posObj is a simple
+                 offset from the base (in WORLD_FRAME, posObj would be an absolute
+                 world coordinate, not an offset, and the torque arm would be
+                 wrong). The trade-off is the force direction rotates slightly
+                 with attitude; at the small tilt angles seen here that's
+                 negligible, and it reads as "a push relative to the platform".
+        offset : [x, y, z] application point relative to the base. Offsetting from
+                 the center of mass makes the shove both translate the platform
+                 AND torque it off-level — exactly the disturbance it must learn
+                 to correct.
+        """
+        p.applyExternalForce(
+            self.drone_id,
+            -1,                        # apply to base body
+            forceObj=list(force),
+            posObj=list(offset),
+            flags=p.LINK_FRAME,
+        )
 
     def step(self, action):
         # ---- 0. Clip action into valid [0, 1] range ----
@@ -162,6 +237,51 @@ class DroneLevitationEnv(gym.Env):
                 flags=p.LINK_FRAME,       # relative to platform's own orientation
             )
 
+        # ---- 1b. Stage 2: random in-flight disturbance injection ----
+        # With small per-step probability, shove the platform with a random
+        # all-directions force (incl. horizontal x/y) applied off-center, so it
+        # gets both knocked sideways AND tilted. The shove is then HELD constant
+        # for a random number of frames: a sustained push of magnitude F for D
+        # frames delivers impulse F * dt * D, so a wide (force x duration) range
+        # covers everything from a single-frame tap to a long, hard shove (incl.
+        # the sustained pushes used in eval). obs/reward are untouched: the policy
+        # only sees the resulting attitude change and must level back out.
+        if self.dist_cfg.get("enabled", False):
+            # Only roll for a NEW shove when none is in progress, so prob is the
+            # probability of *starting* a shove (not re-rolled mid-push). A shove
+            # of duration D starting every ~1/prob steps -> avg D*prob duty cycle.
+            if self._shove_remaining <= 0 and self.np_random.random() < self.dist_cfg.get("prob", 0.015):
+                fmin = self.dist_cfg.get("force_min", 2.0)
+                fmax = self.dist_cfg.get("force_max", 8.0)
+                dmin = int(self.dist_cfg.get("duration_min", 1))
+                dmax = int(self.dist_cfg.get("duration_max", 1))
+                # Random direction on the unit sphere * random magnitude.
+                direction = self.np_random.normal(size=3)
+                norm = np.linalg.norm(direction)
+                if norm > 1e-8:
+                    direction = direction / norm
+                magnitude = self.np_random.uniform(fmin, fmax)
+                # Force, application point, and duration are sampled ONCE and held
+                # for the whole shove (matches a real sustained push). Offset is
+                # within the platform footprint so the shove also torques it
+                # off-level (half_extents are 0.15, 0.15).
+                self._shove_force = direction * magnitude
+                self._shove_offset = [
+                    self.np_random.uniform(-0.15, 0.15),
+                    self.np_random.uniform(-0.15, 0.15),
+                    0.0,
+                ]
+                self._shove_remaining = self.np_random.integers(dmin, dmax + 1)
+
+            # Apply the held force this frame (if a shove is active) and decrement.
+            if self._shove_remaining > 0:
+                self._apply_disturbance(self._shove_force, self._shove_offset)
+                self._shove_remaining -= 1
+                # Being shoved (re)arms the attitude-penalty grace window: it stays
+                # open through the shove and for _grace_frames after the last push,
+                # so the policy isn't punished for the tilt the shove forced on it.
+                self._grace_remaining = self._grace_frames
+
         # ---- 2. Step the physics forward ----
         p.stepSimulation()
 
@@ -169,7 +289,16 @@ class DroneLevitationEnv(gym.Env):
         obs = self._get_obs()
 
         # ---- 4. Reward (Method B Free Float, see reward.py) ----
-        reward = compute_reward(obs, action, self.reward_cfg, self.target_height)
+        # During the grace window, waive the tilt/ang_rate penalties: the policy
+        # shouldn't be charged for being knocked off-level by the disturbance,
+        # only for failing to recover once grace ends.
+        attitude_grace = self._grace_remaining > 0
+        reward = compute_reward(
+            obs, action, self.reward_cfg, self.target_height,
+            attitude_grace=attitude_grace,
+        )
+        if self._grace_remaining > 0:
+            self._grace_remaining -= 1
 
         # ---- 5. Episode termination ----
         height = obs[0]
