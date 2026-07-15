@@ -16,4 +16,8 @@ training/tb_logs/
 runs/
 logs/
 
+# Zephyr build dirs (large, regenerable)
+firmware/**/build/
+firmware/**/build_*/
+
 .ps1
