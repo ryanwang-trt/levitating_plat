@@ -5,17 +5,23 @@
 
 #define I2C_NODE DT_NODELABEL(i2c21)
 
+// Fixed control-loop rate. 200Hz -> 5ms period
+// Matching the sensor's SMPLRT_DIV=4 output rate set in mpu6050_init.
+#define CONTROL_HZ     200
+#define CONTROL_PERIOD K_MSEC(1000 / CONTROL_HZ)
+
 #define MPU6050_ADDR 0x68
 
 // register map
-#define REG_PWR_MGMT_1   0x6B  // bit6 SLEEP=1 at power-on; write 0 to wake
+#define REG_SMPLRT_DIV   0x19  // sample rate = base_rate / (1 + SMPLRT_DIV)
+#define REG_CONFIG       0x1A  // bits2:0 DLPF_CFG (digital low-pass filter)
+#define REG_PWR_MGMT_1   0x6B  // bit6 SLEEP; bits2:0 CLKSEL (clock source)
 #define REG_GYRO_CONFIG  0x1B  // bits4:3 select gyro full-scale range
 #define REG_ACCEL_CONFIG 0x1C  // bits4:3 select accel full-scale range
 #define REG_ACCEL_XOUT_H 0x3B  // first of 14 big-endian bytes:
                                // AX AY AZ TEMP GX GY GZ (2 bytes each)
 
-/* Full-scale select values (write these into the *_CONFIG registers).
-   We pick the most sensitive range for both. */
+//Full-scale select values 
 #define GYRO_FS_250DPS  (0 << 3)  // +/-250 deg/s
 #define ACCEL_FS_2G     (0 << 3)  // +/-2 g
 
@@ -48,10 +54,24 @@ static int16_t be16(const uint8_t *p)
 //Configure the sensor. Return 0 if every write succeeded.
 static int mpu6050_init(const struct device *dev)
 {	
-	//Wake up MPU6050
-	int ret = reg_write(dev, REG_PWR_MGMT_1, 0x00);
+	//Wake up MPU6050 and clock it from the gyro-X PLL (CLKSEL=1), a more
+	//stable timebase than the internal 8MHz oscillator (CLKSEL=0)
+	int ret = reg_write(dev, REG_PWR_MGMT_1, 0x01);
 	if (ret) {
 		return ret; //return non 0 on fail writes
+	}
+
+	//DLPF_CFG=3: ~44Hz low-pass anti-aliasing filter. Also drops the gyro
+	//base output rate to 1kHz, which SMPLRT_DIV below divides down
+	ret = reg_write(dev, REG_CONFIG, 0x03);
+	if (ret) {
+		return ret;
+	}
+
+	//Sample rate = 1kHz / (1 + 4) = 200Hz. Depends on DLPF being enabled above
+	ret = reg_write(dev, REG_SMPLRT_DIV, 0x04);
+	if (ret) {
+		return ret;
 	}
 
 	//Set gyro mearsure range (FS_SEL = 00, therefore low gain)
@@ -103,6 +123,10 @@ static int read_sample(const struct device *dev,
 	return 0;
 }
 
+// Periodic pacing timer for the control loop. No expiry/stop callbacks — 
+// loop just waits on its ticks via k_timer_status_sync().
+K_TIMER_DEFINE(loop_timer, NULL, NULL);
+
 int main(void)
 {
 	const struct device *const i2c = DEVICE_DT_GET(I2C_NODE);
@@ -119,20 +143,45 @@ int main(void)
 		return -EIO;
 	}
 
+	// Start the pacing timer: first tick one period from now, then every period.
+	k_timer_start(&loop_timer, CONTROL_PERIOD, CONTROL_PERIOD);
+
+	uint32_t tick = 0;
+
 	while (1) {
+		//buffers for accelometer, gyroscope and temperature datas
 		float accel_g[3], gyro_dps[3], temp_c;
 
-		if (read_sample(i2c, accel_g, gyro_dps, &temp_c) == 0) {
-			 printf("A[g] % .2f % .2f % .2f  "
-				"G[dps] % .1f % .1f % .1f  T %.1fC\n",
-			    accel_g[0], accel_g[1], accel_g[2],
-				gyro_dps[0], gyro_dps[1], gyro_dps[2], temp_c);
-		} else {
-			printf("read failed\n");
+		uint32_t start = k_cycle_get_32();
+		int rc = read_sample(i2c, accel_g, gyro_dps, &temp_c);
+		uint32_t end = k_cycle_get_32();
+
+		//Get the read duration for later engineering choices. (total time = 5ms)
+		uint32_t read_time = k_cyc_to_us_floor32(end - start);
+
+		//Per 100 ticks
+		if (tick % 100 == 0) {
+			if (rc == 0) {
+				printf("t=%u up=%ums read_duration=%uus Az=% .2f\n",
+				    tick, k_uptime_get_32(), read_time,
+				    (double)accel_g[2]);
+			} else {
+				printf("t=%u read failed\n", tick);
+			}
 		}
 
-		// 10 Hz — slow enough to read on the terminal by eye.
-		k_sleep(K_MSEC(100));
+		tick++;
+
+		// Block until the next timer tick
+
+		//total elapsed ticks in this thread (should be only 1) 
+		uint32_t elapsed = k_timer_status_sync(&loop_timer);
+
+		// if more than 1 tick has passed it means the work is too long for 5ms
+		if (elapsed>1){
+			uint32_t missed = elapsed - 1;
+			printf("OVERRUN at t=%u: missed %u tick(s)\n", tick, missed);
+		}
 	}
 
 	return 0;
