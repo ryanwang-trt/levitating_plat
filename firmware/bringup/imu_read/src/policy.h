@@ -4,7 +4,11 @@
 #define POLICY_H
 
 // Run one forward pass: obs[6] -> action[4]. Outputs are clamped to [0,1],
-// matching the training-time action clip and the ONNX export's baked-in clamp.
 void policy_forward(const float obs[6], float action[4]);
+
+// Check policy_forward against the reference (obs, action) in policy_weights.h.
+// Returns 0 if all outputs are within tolerance, else -1; writes max abs error
+// to *max_error if non-NULL.
+int policy_self_check(float tolerance, float *max_error);
 
 #endif  // POLICY_H

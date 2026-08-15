@@ -51,3 +51,23 @@ void policy_forward(const float obs[6], float action[4])
 		action[motor] = clampf(sum, 0.0f, 1.0f);
 	}
 }
+
+int policy_self_check(float tolerance, float *max_error)
+{
+	float computed_action[POLICY_ACT_DIM];
+	policy_forward(POLICY_REF_OBS, computed_action);
+
+	// Largest absolute error across the 4 outputs vs the compiled-in reference.
+	float worst_error = 0.0f;
+	for (int i = 0; i < POLICY_ACT_DIM; i++) {
+		float abs_error = fabsf(computed_action[i] - POLICY_REF_ACTION[i]);
+		if (abs_error > worst_error) {
+			worst_error = abs_error;
+		}
+	}
+
+	if (max_error != NULL) {
+		*max_error = worst_error;
+	}
+	return (worst_error <= tolerance) ? 0 : -1;
+}

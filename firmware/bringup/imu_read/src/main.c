@@ -2,6 +2,9 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
 #include <stdio.h>
+#include <math.h>
+
+#include "policy.h"
 
 #define I2C_NODE DT_NODELABEL(i2c21)
 
@@ -123,7 +126,37 @@ static int read_sample(const struct device *dev,
 	return 0;
 }
 
-// Periodic pacing timer for the control loop. No expiry/stop callbacks — 
+#define TARGET_HEIGHT_M 0.5f              // sim hover target (env.target_height)
+#define DEG2RAD         (3.14159265f / 180.0f)
+
+// Assemble the 6-element observation the policy expects, in the SAME units as the
+// training sim (env._get_obs):
+//   obs[0] height (m)         obs[1] vz (m/s)
+//   obs[2] roll (rad)         obs[3] pitch (rad)
+//   obs[4] roll_rate (rad/s)  obs[5] pitch_rate (rad/s)
+static void build_obs(const float accel_g[3], const float gyro_dps[3], float obs[6])
+{
+	// height + vz come from the ToF sensor（not soldered yet）
+	// STUB: at target height and not moving vertically.
+	obs[0] = TARGET_HEIGHT_M;
+	obs[1] = 0.0f;
+
+	// get rotation about x-axis (roll) and about y-axis (pitch)
+	float roll = atan2f(accel_g[1],accel_g[2]); //phi = atan ay/az
+	float pitch = atan2f(-accel_g[0],sqrt(accel_g[1]*accel_g[1]+accel_g[2]*accel_g[2])); //theta = -ax/ sqrt(ay2+az2)
+
+	obs[2] = roll;   // roll (rad)
+	obs[3] = pitch;   // pitch (rad)
+
+	// roll_rate + pitch_rate from the gyro, converting dps -> rad/s.
+	float roll_rate = gyro_dps[0]*DEG2RAD;
+	float pitch_rate = gyro_dps[1]*DEG2RAD;
+
+	obs[4] = roll_rate;   // roll_rate (rad/s)
+	obs[5] = pitch_rate;   // pitch_rate (rad/s)
+}
+
+// Periodic pacing timer for the control loop. No expiry/stop callbacks —
 // loop just waits on its ticks via k_timer_status_sync().
 K_TIMER_DEFINE(loop_timer, NULL, NULL);
 
@@ -143,6 +176,15 @@ int main(void)
 		return -EIO;
 	}
 
+	// Verify the flashed policy reproduces its reference before the loop uses it.
+	float selfcheck_error;
+	if (policy_self_check(1e-3f, &selfcheck_error) == 0) {
+		printf("policy self-check PASS (max err %.2e)\n", (double)selfcheck_error);
+	} else {
+		printf("policy self-check FAIL (err %.2e): output != reference; "
+		       "policy_weights.h corrupt or build broken\n", (double)selfcheck_error);
+	}
+
 	// Start the pacing timer: first tick one period from now, then every period.
 	k_timer_start(&loop_timer, CONTROL_PERIOD, CONTROL_PERIOD);
 
@@ -159,12 +201,21 @@ int main(void)
 		//Get the read duration for later engineering choices. (total time = 5ms)
 		uint32_t read_time = k_cyc_to_us_floor32(end - start);
 
+		// assemble the obs, run the policy, time the inference.
+		float obs[6], action[4];
+		build_obs(accel_g, gyro_dps, obs);
+
+		uint32_t infer_start = k_cycle_get_32();
+		policy_forward(obs, action);
+		uint32_t infer_time = k_cyc_to_us_floor32(k_cycle_get_32() - infer_start);
+
 		//Per 100 ticks
 		if (tick % 100 == 0) {
 			if (rc == 0) {
-				printf("t=%u up=%ums read_duration=%uus Az=% .2f\n",
-				    tick, k_uptime_get_32(), read_time,
-				    (double)accel_g[2]);
+				printf("t=%u read=%uus infer=%uus  act=% .2f % .2f % .2f % .2f\n",
+				    tick, read_time, infer_time,
+				    (double)action[0], (double)action[1],
+				    (double)action[2], (double)action[3]);
 			} else {
 				printf("t=%u read failed\n", tick);
 			}
