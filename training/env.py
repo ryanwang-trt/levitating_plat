@@ -6,6 +6,12 @@ import pybullet_data
 
 from reward import compute_reward
 
+# Set to 200 Hz to match the on-hardware control loop (firmware imu_read runs a 200 Hz
+# k_timer loop)
+
+# Training and deployment MUST share a timestep
+CONTROL_HZ = 200
+
 
 class DroneLevitationEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 60}
@@ -107,6 +113,9 @@ class DroneLevitationEnv(gym.Env):
         
         p.resetSimulation()
         p.setGravity(0, 0, -9.81)
+        # resetSimulation() reverts the timestep to PyBullet's 240 Hz default, so
+        # re-assert the 200 Hz control rate every episode (see CONTROL_HZ).
+        p.setTimeStep(1.0 / CONTROL_HZ)
 
         # Ground plane
         self.plane_id = p.loadURDF("plane.urdf")

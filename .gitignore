@@ -10,14 +10,17 @@ __pycache__/
 .pytest_cache/
 
 # Training artifacts (临时模型，发布的预训练模型单独 add)
-*.zip
-training/models/
+*.npz
 training/tb_logs/
 runs/
 logs/
+*.log
 
 # Zephyr build dirs (large, regenerable)
 firmware/**/build/
 firmware/**/build_*/
 
 .ps1
+
+# macOS
+.DS_Store

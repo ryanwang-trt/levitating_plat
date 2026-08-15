@@ -10,7 +10,7 @@ import time
 import yaml
 import numpy as np
 from stable_baselines3 import PPO
-from env import DroneLevitationEnv
+from env import DroneLevitationEnv, CONTROL_HZ
 import pybullet as p
 
 SCRIPT_DIR = Path(__file__).parent
@@ -25,6 +25,11 @@ parser.add_argument(
     "model", nargs="?", default="stage2b",
     help="stage name (-> models/<name>/best) or a path to a model .zip "
          "(default: stage2b, the last curriculum stage)",
+)
+parser.add_argument(
+    "--speed", type=float, default=1.0,
+    help="playback speed multiplier: 1.0 = real-time, 3.0 = 3x faster, "
+         "0.5 = half speed. Only affects viewing pace, not the physics.",
 )
 args = parser.parse_args()
 
@@ -56,7 +61,7 @@ p.resetDebugVisualizerCamera(
     cameraTargetPosition=[0, 0, 0.5],   # 对准点：平台的目标高度 0.5m
 )
 
-DT = 1 / 240                # PyBullet default timestep
+DT = 1 / CONTROL_HZ         # match the sim's control rate (env.CONTROL_HZ = 200 Hz)
 
 # Deterministic shoves: {start_step: [fx, fy, fz]} in the platform link frame.
 # NOTE: these are sized to match the current TRAINING disturbance range so the
@@ -119,7 +124,7 @@ for ep in range(3):
             print(f"        +{steps - last_shove_step:3d} steps: "
                   f"roll={obs[2]:+.3f} pitch={obs[3]:+.3f}")
 
-        time.sleep(DT)      # 放慢到肉眼能看(PyBullet 默认 240Hz)
+        time.sleep(DT / args.speed)   # pace playback; --speed >1 speeds it up
         done = terminated or truncated
 
     # Success = survived the full episode (truncated at the step cap) without
