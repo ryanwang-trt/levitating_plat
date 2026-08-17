@@ -35,6 +35,11 @@
 #define ACCEL_LSB_PER_G    16384.0f
 #define GYRO_LSB_PER_DPS   131.0f
 
+// Per-sensor bias, measured at boot by calibrate(). Zero until then, so the
+// calibration reads see raw values. gyro_bias in dps, accel_offset in g.
+static float gyro_bias[3]    = {0.0f, 0.0f, 0.0f};
+static float accel_offset[3] = {0.0f, 0.0f, 0.0f};
+
 // I/O helpers (return 0 on success)
 static int reg_write(const struct device *dev, uint8_t reg, uint8_t val)
 {
@@ -113,17 +118,56 @@ static int read_sample(const struct device *dev,
 	int16_t gyroY=be16(&raw[10]);
 	int16_t gyroZ=be16(&raw[12]);
 	
-	accel_g[0] = ax/ACCEL_LSB_PER_G;
-	accel_g[1] = ay/ACCEL_LSB_PER_G;
-	accel_g[2] = az/ACCEL_LSB_PER_G - 0.3f;  // clone Z zero-bias, from flip test
+	// Scale to physical units, then subtract the per-sensor bias measured at boot.
+	accel_g[0] = ax/ACCEL_LSB_PER_G - accel_offset[0];
+	accel_g[1] = ay/ACCEL_LSB_PER_G - accel_offset[1];
+	accel_g[2] = az/ACCEL_LSB_PER_G - accel_offset[2];
 
-	gyro_dps[0] = gyroX/GYRO_LSB_PER_DPS;
-	gyro_dps[1] = gyroY/GYRO_LSB_PER_DPS;
-	gyro_dps[2] = gyroZ/GYRO_LSB_PER_DPS;
+	gyro_dps[0] = gyroX/GYRO_LSB_PER_DPS - gyro_bias[0];
+	gyro_dps[1] = gyroY/GYRO_LSB_PER_DPS - gyro_bias[1];
+	gyro_dps[2] = gyroZ/GYRO_LSB_PER_DPS - gyro_bias[2];
 
 	*temp_c = temp/ 340.0f + 36.53f;
 	
 	return 0;
+}
+
+// Measure per-sensor bias by averaging N samples while the board is held STILL
+// and LEVEL to subtract from future mearsurement
+static void calibrate(const struct device *dev)
+{
+	const int samples = 200;   // ~1s at 200Hz
+	float accel_sum[3] = {0.0f, 0.0f, 0.0f};
+	float gyro_sum[3]  = {0.0f, 0.0f, 0.0f};
+	int valid = 0;
+
+	for (int n = 0; n < samples; n++) {
+		float a[3], g[3], t;
+		if (read_sample(dev, a, g, &t) == 0) {   // biases are still 0 -> raw
+			for (int i = 0; i < 3; i++) {
+				accel_sum[i] += a[i];
+				gyro_sum[i]  += g[i];
+			}
+			valid++;
+		}
+		k_sleep(K_MSEC(5));
+	}
+
+	if (valid == 0) {
+		printf("calibrate: no valid samples, biases left at 0\n");
+		return;
+	}
+
+	for (int i = 0; i < 3; i++) {
+		gyro_bias[i]    = gyro_sum[i]  / valid;
+		accel_offset[i] = accel_sum[i] / valid;
+	}
+	accel_offset[2] -= 1.0f;   // level rest reads +1g on Z; the excess is the offset
+
+	printf("calibrated: gyro_bias=[% .2f % .2f % .2f]dps  "
+	       "accel_offset=[% .3f % .3f % .3f]g\n",
+	       (double)gyro_bias[0], (double)gyro_bias[1], (double)gyro_bias[2],
+	       (double)accel_offset[0], (double)accel_offset[1], (double)accel_offset[2]);
 }
 
 #define TARGET_HEIGHT_M 0.5f              // sim hover target (env.target_height)
@@ -184,6 +228,10 @@ int main(void)
 		printf("policy self-check FAIL (err %.2e): output != reference; "
 		       "policy_weights.h corrupt or build broken\n", (double)selfcheck_error);
 	}
+
+	// Measure sensor bias before flying. Board must sit still and level.
+	printf("calibrating -- hold still & level...\n");
+	calibrate(i2c);
 
 	// Start the pacing timer: first tick one period from now, then every period.
 	k_timer_start(&loop_timer, CONTROL_PERIOD, CONTROL_PERIOD);
