@@ -260,8 +260,9 @@ int main(void)
 		//Per 100 ticks
 		if (tick % 100 == 0) {
 			if (rc == 0) {
-				printf("t=%u read=%uus infer=%uus  act=% .2f % .2f % .2f % .2f\n",
-				    tick, read_time, infer_time,
+				printf("t=%u roll=% .1f pitch=% .1f deg  act=% .2f % .2f % .2f % .2f\n",
+				    tick,
+				    (double)(obs[2] * 57.2958f), (double)(obs[3] * 57.2958f),
 				    (double)action[0], (double)action[1],
 				    (double)action[2], (double)action[3]);
 			} else {
