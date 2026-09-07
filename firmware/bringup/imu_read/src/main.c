@@ -5,6 +5,7 @@
 #include <math.h>
 
 #include "policy.h"
+#include "tof.h"
 
 #define I2C_NODE DT_NODELABEL(i2c21)
 
@@ -200,6 +201,7 @@ static void build_obs(const float accel_g[3], const float gyro_dps[3], float obs
 	obs[5] = pitch_rate;   // pitch_rate (rad/s)
 }
 
+
 // Periodic pacing timer for the control loop. No expiry/stop callbacks —
 // loop just waits on its ticks via k_timer_status_sync().
 K_TIMER_DEFINE(loop_timer, NULL, NULL);
@@ -249,6 +251,11 @@ int main(void)
 		//Get the read duration for later engineering choices. (total time = 5ms)
 		uint32_t read_time = k_cyc_to_us_floor32(end - start);
 
+		// Snapshot the latest ToF sample: O(1) copy, never blocks on the sensor.
+		// Stage 2 only proves concurrency -- Stage 4 feeds these into build_obs().
+		struct tof_sample tof;
+		tof_get_latest(&tof);
+
 		// assemble the obs, run the policy, time the inference.
 		float obs[6], action[4];
 		build_obs(accel_g, gyro_dps, obs);
@@ -260,11 +267,12 @@ int main(void)
 		//Per 100 ticks
 		if (tick % 100 == 0) {
 			if (rc == 0) {
-				printf("t=%u roll=% .1f pitch=% .1f deg  act=% .2f % .2f % .2f % .2f\n",
-				    tick,
-				    (double)(obs[2] * 57.2958f), (double)(obs[3] * 57.2958f),
-				    (double)action[0], (double)action[1],
-				    (double)action[2], (double)action[3]);
+				// Timing proves the loop is unaffected; tof age proves the thread
+			// is publishing concurrently (should refresh every ~33-40ms).
+			printf("t=%u rd=%uus inf=%uus  h=%.3fm vz=%+.2f age=%dms\n",
+				    tick, read_time, infer_time,
+				    (double)tof.height, (double)tof.vz,
+				    (int)(k_uptime_get() - tof.timestamp));
 			} else {
 				printf("t=%u read failed\n", tick);
 			}

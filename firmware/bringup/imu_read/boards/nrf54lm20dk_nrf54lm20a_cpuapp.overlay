@@ -26,4 +26,10 @@
 	pinctrl-0 = <&i2c21_default>;
 	pinctrl-1 = <&i2c21_sleep>;
 	pinctrl-names = "default", "sleep";
+
+	tof: vl53l0x@29 {
+		compatible = "st,vl53l0x";
+		reg = <0x29>;
+		/* xshut-gpios = <&gpio1 10 GPIO_ACTIVE_LOW>;  // only if XSHUT wired */
+	};
 };
