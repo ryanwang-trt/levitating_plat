@@ -33,3 +33,4 @@
 		/* xshut-gpios = <&gpio1 10 GPIO_ACTIVE_LOW>;  // only if XSHUT wired */
 	};
 };
+

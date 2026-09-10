@@ -9,8 +9,11 @@
 #define TOF_NODE DT_NODELABEL(tof)
 
 // The control loop runs in main() at CONFIG_MAIN_THREAD_PRIORITY=0
-#define TOF_THREAD_PRIORITY   5
+#define TOF_THREAD_PRIORITY 5
 #define TOF_THREAD_STACK_SIZE 2048
+
+#define TOF_ALPHA 0.5f
+#define TOF_BETA 0.167f
 
 static struct tof_sample tof_shared;
 static K_MUTEX_DEFINE(tof_lock);
@@ -41,10 +44,15 @@ static void tof_thread_fn(void *p1, void *p2, void *p3)
 		return;
 	}
 
-	// Previous sample, for the finite difference that produces vz.
+	// Previous raw sample, for the finite difference that produces vz_raw.
 	float prev_height = 0.0f;
 	int64_t prev_time = 0;
 	bool have_prev = false;
+
+	// Alpha-beta filter state (height and vertical velocity estimated jointly).
+	float height_est = 0.0f;
+	float vz_est = 0.0f;
+	bool filter_init = false;
 
 	while (1) {
 		// One ranging measurement. Blocks ~33ms but yields (k_sleep) internally,
@@ -56,7 +64,7 @@ static void tof_thread_fn(void *p1, void *p2, void *p3)
 			continue;
 		}
 
-		// Fetch the distance and range status from the sensor. 
+		// Fetch the distance and range status from the sensor.
 		// The range status is used to determine if the reading is valid.
 		struct sensor_value distance, status;
 
@@ -66,8 +74,7 @@ static void tof_thread_fn(void *p1, void *p2, void *p3)
 		}
 
 		int range_status = -1;
-		if (sensor_channel_get(tof,
-				       (enum sensor_channel)SENSOR_CHAN_VL53L0X_RANGE_STATUS,
+		if (sensor_channel_get(tof, (enum sensor_channel)SENSOR_CHAN_VL53L0X_RANGE_STATUS,
 				       &status) == 0) {
 			range_status = status.val1;
 		}
@@ -79,31 +86,49 @@ static void tof_thread_fn(void *p1, void *p2, void *p3)
 		}
 
 		// sensor_value is fixed point: val1 = whole metres, val2 = millionths.
-		float height = (float)distance.val1 + (float)distance.val2 / 1000000.0f;
+		float measurement = distance.val1 + distance.val2 / 1000000.0f;
 		int64_t now = k_uptime_get();
 
-		// Get the vertical velocity (vz) by finite difference. 
-		float vz = 0.0f;
+		float dt = 0.0f;
+		float vz_raw = 0.0f;
 		if (have_prev) {
-			float dt = (float)(now - prev_time) / 1000.0f; 
+			dt = (now - prev_time) / 1000.0f;
 			if (dt > 0.0f) {
-				vz = (height - prev_height) / dt;
+				vz_raw = (measurement - prev_height) / dt;
 			}
 		}
 
-		// Update all three fields at once
+		// Alpha-beta filter: update the height and vertical velocity estimates.
+		if (!filter_init) {
+			height_est = measurement;
+			vz_est = 0.0f;
+			filter_init = true;
+		} else if (dt > 0.0f) {
+			// 1. Predict the next height based on the previous height and velocity.
+			float height_pred = height_est + vz_est * dt;
+			// 2. Compute the residual (difference between the actual measurement and the prediction).
+			float residual = measurement - height_pred;
+
+			// 3. update the estimates based on the residual and the alpha-beta gains.
+			height_est = height_pred + TOF_ALPHA * residual;
+			vz_est = vz_est + (TOF_BETA / dt) * residual;
+		}
+
+		// Update every field at once
 		k_mutex_lock(&tof_lock, K_FOREVER);
-		tof_shared.height    = height;
-		tof_shared.vz        = vz;
+		tof_shared.height = height_est;
+		tof_shared.vz = vz_est;
+		tof_shared.height_raw = measurement;
+		tof_shared.vz_raw = vz_raw;
 		tof_shared.timestamp = now;
 		k_mutex_unlock(&tof_lock);
 
-		prev_height = height;
-		prev_time   = now;
-		have_prev   = true;
+		prev_height = measurement;
+		prev_time = now;
+		have_prev = true;
 
 		// yield to the control loop and other threads.
-		k_sleep(K_MSEC(5));  
+		k_sleep(K_MSEC(5));
 	}
 }
 

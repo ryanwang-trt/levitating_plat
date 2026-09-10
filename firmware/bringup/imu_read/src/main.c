@@ -6,39 +6,40 @@
 
 #include "policy.h"
 #include "tof.h"
+#include "attitude.h"
 
 #define I2C_NODE DT_NODELABEL(i2c21)
 
 // Fixed control-loop rate. 200Hz -> 5ms period
 // Matching the sensor's SMPLRT_DIV=4 output rate set in mpu6050_init.
-#define CONTROL_HZ     200
+#define CONTROL_HZ 200
 #define CONTROL_PERIOD K_MSEC(1000 / CONTROL_HZ)
 
 #define MPU6050_ADDR 0x68
 
 // register map
-#define REG_SMPLRT_DIV   0x19  // sample rate = base_rate / (1 + SMPLRT_DIV)
-#define REG_CONFIG       0x1A  // bits2:0 DLPF_CFG (digital low-pass filter)
-#define REG_PWR_MGMT_1   0x6B  // bit6 SLEEP; bits2:0 CLKSEL (clock source)
-#define REG_GYRO_CONFIG  0x1B  // bits4:3 select gyro full-scale range
-#define REG_ACCEL_CONFIG 0x1C  // bits4:3 select accel full-scale range
-#define REG_ACCEL_XOUT_H 0x3B  // first of 14 big-endian bytes:
+#define REG_SMPLRT_DIV 0x19   // sample rate = base_rate / (1 + SMPLRT_DIV)
+#define REG_CONFIG 0x1A   // bits2:0 DLPF_CFG (digital low-pass filter)
+#define REG_PWR_MGMT_1 0x6B   // bit6 SLEEP; bits2:0 CLKSEL (clock source)
+#define REG_GYRO_CONFIG 0x1B   // bits4:3 select gyro full-scale range
+#define REG_ACCEL_CONFIG 0x1C   // bits4:3 select accel full-scale range
+#define REG_ACCEL_XOUT_H 0x3B   // first of 14 big-endian bytes:
                                // AX AY AZ TEMP GX GY GZ (2 bytes each)
 
-//Full-scale select values 
-#define GYRO_FS_250DPS  (0 << 3)  // +/-250 deg/s
-#define ACCEL_FS_2G     (0 << 3)  // +/-2 g
+//Full-scale select values
+#define GYRO_FS_250DPS  (0 << 3)   // +/-250 deg/s
+#define ACCEL_FS_2G     (0 << 3)   // +/-2 g
 
 /* Scale factors for the ranges above (LSB per unit), from the datasheet:
-     accel +/-2 g   -> 16384 LSB/g
-     gyro  +/-250   -> 131.0 LSB/(deg/s)
-   Temperature:  degC = raw/340 + 36.53 */
-#define ACCEL_LSB_PER_G    16384.0f
-#define GYRO_LSB_PER_DPS   131.0f
+     accel +/-2 g -> 16384 LSB/g
+     gyro +/-250 -> 131.0 LSB/(deg/s)
+   Temperature: degC = raw/340 + 36.53 */
+#define ACCEL_LSB_PER_G 16384.0f
+#define GYRO_LSB_PER_DPS 131.0f
 
 // Per-sensor bias, measured at boot by calibrate(). Zero until then, so the
 // calibration reads see raw values. gyro_bias in dps, accel_offset in g.
-static float gyro_bias[3]    = {0.0f, 0.0f, 0.0f};
+static float gyro_bias[3] = {0.0f, 0.0f, 0.0f};
 static float accel_offset[3] = {0.0f, 0.0f, 0.0f};
 
 // I/O helpers (return 0 on success)
@@ -62,12 +63,12 @@ static int16_t be16(const uint8_t *p)
 
 //Configure the sensor. Return 0 if every write succeeded.
 static int mpu6050_init(const struct device *dev)
-{	
+{
 	//Wake up MPU6050 and clock it from the gyro-X PLL (CLKSEL=1), a more
 	//stable timebase than the internal 8MHz oscillator (CLKSEL=0)
 	int ret = reg_write(dev, REG_PWR_MGMT_1, 0x01);
 	if (ret) {
-		return ret; //return non 0 on fail writes
+		return ret;   //return non 0 on fail writes
 	}
 
 	//DLPF_CFG=3: ~44Hz low-pass anti-aliasing filter. Also drops the gyro
@@ -93,7 +94,7 @@ static int mpu6050_init(const struct device *dev)
 	ret = reg_write(dev, REG_ACCEL_CONFIG, ACCEL_FS_2G);
 
 	//Return 0 if all ret has value 0 (succeeded writes)
-	return ret; 
+	return ret;
 }
 
 //read one sample set and convert to physical units.
@@ -118,7 +119,7 @@ static int read_sample(const struct device *dev,
 	int16_t gyroX=be16(&raw[8]);
 	int16_t gyroY=be16(&raw[10]);
 	int16_t gyroZ=be16(&raw[12]);
-	
+
 	// Scale to physical units, then subtract the per-sensor bias measured at boot.
 	accel_g[0] = ax/ACCEL_LSB_PER_G - accel_offset[0];
 	accel_g[1] = ay/ACCEL_LSB_PER_G - accel_offset[1];
@@ -129,7 +130,7 @@ static int read_sample(const struct device *dev,
 	gyro_dps[2] = gyroZ/GYRO_LSB_PER_DPS - gyro_bias[2];
 
 	*temp_c = temp/ 340.0f + 36.53f;
-	
+
 	return 0;
 }
 
@@ -139,7 +140,7 @@ static void calibrate(const struct device *dev)
 {
 	const int samples = 200;   // ~1s at 200Hz
 	float accel_sum[3] = {0.0f, 0.0f, 0.0f};
-	float gyro_sum[3]  = {0.0f, 0.0f, 0.0f};
+	float gyro_sum[3] = {0.0f, 0.0f, 0.0f};
 	int valid = 0;
 
 	for (int n = 0; n < samples; n++) {
@@ -147,7 +148,7 @@ static void calibrate(const struct device *dev)
 		if (read_sample(dev, a, g, &t) == 0) {   // biases are still 0 -> raw
 			for (int i = 0; i < 3; i++) {
 				accel_sum[i] += a[i];
-				gyro_sum[i]  += g[i];
+				gyro_sum[i] += g[i];
 			}
 			valid++;
 		}
@@ -160,7 +161,7 @@ static void calibrate(const struct device *dev)
 	}
 
 	for (int i = 0; i < 3; i++) {
-		gyro_bias[i]    = gyro_sum[i]  / valid;
+		gyro_bias[i] = gyro_sum[i] / valid;
 		accel_offset[i] = accel_sum[i] / valid;
 	}
 	accel_offset[2] -= 1.0f;   // level rest reads +1g on Z; the excess is the offset
@@ -171,8 +172,8 @@ static void calibrate(const struct device *dev)
 	       (double)accel_offset[0], (double)accel_offset[1], (double)accel_offset[2]);
 }
 
-#define TARGET_HEIGHT_M 0.5f              // sim hover target (env.target_height)
-#define DEG2RAD         (3.14159265f / 180.0f)
+#define TARGET_HEIGHT_M 0.5f   // sim hover target (env.target_height)
+#define DEG2RAD (3.14159265f / 180.0f)
 
 // Assemble the 6-element observation the policy expects, in the SAME units as the
 // training sim (env._get_obs):
@@ -187,8 +188,8 @@ static void build_obs(const float accel_g[3], const float gyro_dps[3], float obs
 	obs[1] = 0.0f;
 
 	// get rotation about x-axis (roll) and about y-axis (pitch)
-	float roll = atan2f(accel_g[1],accel_g[2]); //phi = atan ay/az
-	float pitch = atan2f(-accel_g[0],sqrt(accel_g[1]*accel_g[1]+accel_g[2]*accel_g[2])); //theta = -ax/ sqrt(ay2+az2)
+	float roll = atan2f(accel_g[1],accel_g[2]);   //phi = atan ay/az
+	float pitch = atan2f(-accel_g[0],sqrt(accel_g[1]*accel_g[1]+accel_g[2]*accel_g[2]));   //theta = -ax/ sqrt(ay2+az2)
 
 	obs[2] = roll;   // roll (rad)
 	obs[3] = pitch;   // pitch (rad)
@@ -251,10 +252,13 @@ int main(void)
 		//Get the read duration for later engineering choices. (total time = 5ms)
 		uint32_t read_time = k_cyc_to_us_floor32(end - start);
 
-		// Snapshot the latest ToF sample: O(1) copy, never blocks on the sensor.
-		// Stage 2 only proves concurrency -- Stage 4 feeds these into build_obs().
+		// Snapshot the latest ToF sample (wont block main loop)
 		struct tof_sample tof;
 		tof_get_latest(&tof);
+
+		// Run the complementary filter every tick
+		struct attitude att;
+		attitude_update(accel_g, gyro_dps, 1.0f / CONTROL_HZ, &att);
 
 		// assemble the obs, run the policy, time the inference.
 		float obs[6], action[4];
@@ -264,17 +268,22 @@ int main(void)
 		policy_forward(obs, action);
 		uint32_t infer_time = k_cyc_to_us_floor32(k_cycle_get_32() - infer_start);
 
-		//Per 100 ticks
+		//print some debug info every 100 ticks (0.5s) alternating between attitude and ToF
 		if (tick % 100 == 0) {
-			if (rc == 0) {
-				// Timing proves the loop is unaffected; tof age proves the thread
-			// is publishing concurrently (should refresh every ~33-40ms).
-			printf("t=%u rd=%uus inf=%uus  h=%.3fm vz=%+.2f age=%dms\n",
-				    tick, read_time, infer_time,
-				    (double)tof.height, (double)tof.vz,
-				    (int)(k_uptime_get() - tof.timestamp));
-			} else {
+			if (rc != 0) {
 				printf("t=%u read failed\n", tick);
+			} else if ((tick / 100) % 2 == 0) {
+				printf("t=%u R %+.1f/%+.1f P %+.1f/%+.1f deg rd=%uus inf=%uus\n",
+				       tick,
+				       (double)(att.roll * 57.2958f), (double)(att.roll_accel * 57.2958f),
+				       (double)(att.pitch * 57.2958f), (double)(att.pitch_accel * 57.2958f),
+				       read_time, infer_time);
+			} else {
+				printf("t=%u H %.3f/%.3f V %+.2f/%+.2f age=%dms\n",
+				       tick,
+				       (double)tof.height, (double)tof.height_raw,
+				       (double)tof.vz, (double)tof.vz_raw,
+				       (int)(k_uptime_get() - tof.timestamp));
 			}
 		}
 
@@ -282,7 +291,7 @@ int main(void)
 
 		// Block until the next timer tick
 
-		//total elapsed ticks in this thread (should be only 1) 
+		//total elapsed ticks in this thread (should be only 1)
 		uint32_t elapsed = k_timer_status_sync(&loop_timer);
 
 		// if more than 1 tick has passed it means the work is too long for 5ms
