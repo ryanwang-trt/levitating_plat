@@ -4,7 +4,7 @@
 
 Solo, full-stack project spanning RL training in simulation through firmware deployment on real embedded hardware — built as a flagship project for ML engineering and embedded/firmware/systems roles.
 
-**Status: not yet flying.** Sensor read + on-device inference are verified on real hardware at 200 Hz. Motor/ESC output and the tethered free-float demo are the remaining milestones.
+**Status: not yet flying.** Full sensing (IMU + time-of-flight), filtering, and on-device inference are verified on real hardware at 200 Hz. Motor/ESC output and the tethered free-float demo are the remaining milestones.
 
 ---
 
@@ -31,6 +31,9 @@ A PPO policy trained entirely in PyBullet simulation is exported and re-implemen
                                     nRF54LM20 DK — Cortex-M33
                                     200 Hz k_timer control loop:
                                       IMU read → build obs[6] → policy_forward() → action[4]
+                                             ▲
+                                    ToF thread (~30 Hz, prio 5)
+                                    publishes height/vz via mutex
 ```
 
 | Layer | Tech |
@@ -43,7 +46,8 @@ A PPO policy trained entirely in PyBullet simulation is exported and re-implemen
 | Firmware | Zephyr RTOS, nRF Connect SDK v3.3.0 |
 | Board | nRF54LM20 DK, Cortex-M33 |
 | IMU | MPU-6050-clone (GY-521 breakout), I²C |
-| Height / vz sensing | Time-of-flight sensor — **not yet wired**, stubbed in firmware |
+| Height / vz sensing | VL53L0X time-of-flight, I²C (shares the IMU bus at 0x29 vs 0x68) |
+| Filtering | Complementary filter for roll/pitch; alpha-beta for height/vz |
 
 **Why CPU inference, not the NPU:** the MLP is tiny (~5K MACs). The M33's FPU runs a full forward pass in ~560 µs, well inside the 5 ms control budget. Quantizing for the NPU would add a toolchain for no real benefit at this size — only worth revisiting for a much larger or vision-based policy.
 
@@ -51,7 +55,7 @@ A PPO policy trained entirely in PyBullet simulation is exported and re-implemen
 
 ## Engineering log: core debugging wins
 
-Four bugs, each found and fixed with a measurement, not a guess:
+Five bugs, each found and fixed with a measurement:
 
 **1. Eval RNG contamination.** The eval environment was seeded once at startup instead of on every reset, so the RNG stream kept advancing — two evaluations of the *same* checkpoint returned different scores (232.0 vs. 199.2, ~33 apart), which corrupted which checkpoint got saved as "best." A `FixedSeedReset` wrapper applied only to the eval env fixed it: three repeat evaluations of the same checkpoint returned identical scores (691.21 / 691.21 / 691.21, spread 0.0000).
 
@@ -60,6 +64,8 @@ Four bugs, each found and fixed with a measurement, not a guess:
 **3. Perverse early-termination incentive.** Once sustained shoves were added, training collapsed — negative reward for the entire run, episode length falling from a clean 1000 to ~700–880. Root cause: the per-step penalty during a post-shove recovery (tilt + angular-rate penalties) was ~8× the alive bonus (net −7.96/step vs. +1.0), so the policy's cheapest way to stop the bleeding was to tip over and end the episode early — it learned to give up, not recover. Fixed with an `attitude_grace` window that waives the tilt/angular-rate penalty during and briefly after a shove, while keeping the alive bonus and energy penalty active so "die early" stops being free.
 
 **4. Stage 2b grace duty-cycle bug (in progress).** A later curriculum stage collapsed again (episode length stuck ~880, early-terminating). Diagnosed root cause: the grace window was being *reset* to its full length on every active shove frame instead of decrementing, so at the harder stage's shove-duration/probability settings the grace duty cycle exceeded ~70% — the attitude penalty was effectively disabled almost all the time, resurrecting bug #3's incentive under a different mechanism. Fix in progress: make grace a one-shot window triggered at shove *end* rather than re-armed mid-shove, or shrink the window. Retrain + deterministic eval validation still pending.
+
+**5. Sampled timing hid a 140× worse number.** After adding the ToF sensor on the same I²C bus as the IMU, the decimated debug print (1 tick in 100) suggested bus contention was costing the IMU read about **+9 µs** — negligible. Replacing sampling with min/mean/max accumulated across *every* tick, plus a runtime toggle to A/B the ToF on and off, showed the real worst case was **+1248 µs**. Contention is intermittent by nature — the ToF polls its status register every 2 ms during a 33 ms conversion, and only occasionally collides with the IMU's burst read — so sampling 1% of ticks almost always misses the collisions. Consequence: worst-case loop utilisation is **3.96 / 5 ms (79%)**, not the ~48% the averages imply, and the remaining headroom for motor PWM is ~1 ms rather than ~2.6 ms. Still zero overruns.
 
 **Other notable finding — undamped horizontal drift.** PyBullet bodies have zero air drag by default. After a shove, the policy would recover attitude beautifully, then tip over ~150 frames later for no visible reason — full-state tracing (vx/vy, which the policy can't see) showed ~0.4 m/s of horizontal velocity that never decayed, eventually destabilizing the platform. Since horizontal velocity isn't measurable on the real hardware either, the fix wasn't to add it to the observation (a sim-only crutch) — it was to make the *physics* more realistic. Adding a single linear-damping term (no retraining) flipped post-shove survival from 0/8 to 8/8 episodes.
 
@@ -109,8 +115,10 @@ Each fine-tune stage runs at a much lower learning rate (3e-5) than the from-scr
 |---|---|
 | Boot self-check | PASS — C forward pass vs. PyTorch reference, max error ~6e-8 |
 | Calibration | accel ~1.0 g, gyro ~0 dps at rest, after boot-time auto-calibration |
-| Timing | sensor read ~1.8 ms, inference ~560 µs — zero overruns at 200 Hz (~2.4 / 5 ms budget used) |
+| Timing | sensor read ~1.8 ms, inference ~560 µs — zero overruns at 200 Hz. Worst case with ToF bus traffic: 3.96 / 5 ms (79%) |
 | Axes | roll/pitch cleanly decoupled (±0.5° crosstalk = noise) |
+| Attitude filter | rejects accel corruption — a tap spiked raw pitch to −8.4°, filtered moved 0.9° |
+| Height filter | vz noise ±0.14 → ±0.02 m/s (~7×); ToF sample age stays 0–40 ms |
 | Signs | opposite tilts flip the response correctly (relative sign only — the *absolute* restoring direction can't be confirmed without motors wired) |
 
 **Train/deploy frequency — resolved.** RL was originally trained at PyBullet's 240 Hz default while the firmware loop runs at 200 Hz. The simulation was retrained at 200 Hz (`CONTROL_HZ = 200`) to exactly match the firmware, eliminating the mismatch.
@@ -140,8 +148,10 @@ levitating_plat/
 │           ├── src/
 │           │   ├── main.c             # 200Hz k_timer loop
 │           │   ├── policy.c / .h      # hand-rolled MLP forward pass + self-check
-│           │   └── policy_weights.h   # generated by export_weights.py, committed
-│           └── prj.conf               # CONFIG_FPU, CONFIG_I2C, ...
+│           │   ├── policy_weights.h   # generated by export_weights.py, committed
+│           │   ├── tof.c / .h         # VL53L0X sampling thread + alpha-beta filter
+│           │   └── attitude.c / .h    # complementary filter (gyro + accel)
+│           └── prj.conf               # CONFIG_FPU, CONFIG_I2C, CONFIG_VL53L0X, ...
 │
 ├── tests/                          # env / reward / shove / grace / physics tests
 └── docs/                           # training curves, engineering notes
@@ -171,7 +181,7 @@ Open the board's second VCOM at 115200 baud to see output. **Hold the board stil
 ## Roadmap
 
 - [x] RL curriculum: stage1 → stage2a
-- [ ] Fix stage2b grace bug and retrain, validate with deterministic eval
-- [ ] Wire the ToF sensor, unstub `height` / `vz`
+- [x] Fix stage2b grace bug and retrain, validate with deterministic eval
+- [x] Wire the ToF sensor, unstub `height` / `vz`
 - [ ] ESC integration + PWM output (settles the absolute restoring sign)
 - [ ] Tethered free-float demo
