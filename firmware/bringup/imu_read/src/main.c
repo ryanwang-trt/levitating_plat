@@ -15,6 +15,9 @@
 #define CONTROL_HZ 200
 #define CONTROL_PERIOD K_MSEC(1000 / CONTROL_HZ)
 
+// Timing stats window: 400 ticks = 2s at 200Hz.
+#define WINDOW_TICKS 400
+
 #define MPU6050_ADDR 0x68
 
 // register map
@@ -180,26 +183,24 @@ static void calibrate(const struct device *dev)
 //   obs[0] height (m)         obs[1] vz (m/s)
 //   obs[2] roll (rad)         obs[3] pitch (rad)
 //   obs[4] roll_rate (rad/s)  obs[5] pitch_rate (rad/s)
-static void build_obs(const float accel_g[3], const float gyro_dps[3], float obs[6])
+static void build_obs(const struct attitude *att, const struct tof_sample *tof,
+		      const float gyro_dps[3], float obs[6])
 {
-	// height + vz come from the ToF sensor（not soldered yet）
-	// STUB: at target height and not moving vertically.
-	obs[0] = TARGET_HEIGHT_M;
-	obs[1] = 0.0f;
 
-	// get rotation about x-axis (roll) and about y-axis (pitch)
-	float roll = atan2f(accel_g[1],accel_g[2]);   //phi = atan ay/az
-	float pitch = atan2f(-accel_g[0],sqrt(accel_g[1]*accel_g[1]+accel_g[2]*accel_g[2]));   //theta = -ax/ sqrt(ay2+az2)
+	if (tof_sample_fresh(tof)) {
+		obs[0] = tof->height;
+		obs[1] = tof->vz;
+	} else {
+		obs[0] = TARGET_HEIGHT_M;
+		obs[1] = 0.0f;
+	}
 
-	obs[2] = roll;   // roll (rad)
-	obs[3] = pitch;   // pitch (rad)
+	obs[2] = att->roll;
+	obs[3] = att->pitch;
 
-	// roll_rate + pitch_rate from the gyro, converting dps -> rad/s.
-	float roll_rate = gyro_dps[0]*DEG2RAD;
-	float pitch_rate = gyro_dps[1]*DEG2RAD;
-
-	obs[4] = roll_rate;   // roll_rate (rad/s)
-	obs[5] = pitch_rate;   // pitch_rate (rad/s)
+	// Caliberated gyro rates
+	obs[4] = gyro_dps[0] * DEG2RAD;
+	obs[5] = gyro_dps[1] * DEG2RAD;
 }
 
 
@@ -232,6 +233,8 @@ int main(void)
 		       "policy_weights.h corrupt or build broken\n", (double)selfcheck_error);
 	}
 
+	printf("T+/T- = ToF on/off, rd min/mean/max, o=overruns | H = height, V = vz filt/raw, a = age\n");
+
 	// Measure sensor bias before flying. Board must sit still and level.
 	printf("calibrating -- hold still & level...\n");
 	calibrate(i2c);
@@ -240,6 +243,16 @@ int main(void)
 	k_timer_start(&loop_timer, CONTROL_PERIOD, CONTROL_PERIOD);
 
 	uint32_t tick = 0;
+
+	// Starts true so the first stale sample prints a warning
+	bool tof_was_ok = true;
+
+	// Timing stats window state.
+	uint32_t win_rd_min = UINT32_MAX, win_rd_max = 0, win_rd_sum = 0;
+	uint32_t win_inf_min = UINT32_MAX, win_inf_max = 0, win_inf_sum = 0;
+	uint32_t win_ticks = 0;
+	uint32_t overrun_total = 0;
+	bool win_tof_on = true;
 
 	while (1) {
 		//buffers for accelometer, gyroscope and temperature datas
@@ -260,28 +273,51 @@ int main(void)
 		struct attitude att;
 		attitude_update(accel_g, gyro_dps, 1.0f / CONTROL_HZ, &att);
 
+		// edge detection for when tof sample is STALE or RECOVERED
+		// print the message only when the state changes 
+		bool tof_ok = tof_sample_fresh(&tof);
+		tof_was_ok = tof_ok;   // transition print silenced while testing filters
+
 		// assemble the obs, run the policy, time the inference.
 		float obs[6], action[4];
-		build_obs(accel_g, gyro_dps, obs);
+		build_obs(&att, &tof, gyro_dps, obs);
 
 		uint32_t infer_start = k_cycle_get_32();
 		policy_forward(obs, action);
 		uint32_t infer_time = k_cyc_to_us_floor32(k_cycle_get_32() - infer_start);
 
+		// Timing stats accumulated on EVERY tick
+		if (read_time < win_rd_min) win_rd_min = read_time;
+		if (read_time > win_rd_max) win_rd_max = read_time;
+		win_rd_sum += read_time;
+		if (infer_time < win_inf_min) win_inf_min = infer_time;
+		if (infer_time > win_inf_max) win_inf_max = infer_time;
+		win_inf_sum += infer_time;
+		win_ticks++;
+
+		// Every WINDOW_TICKS: report, then flip the ToF on/off. 
+		if (win_ticks >= WINDOW_TICKS) {
+			// Short on purpose: a long line blocks past the 5ms tick and would
+			// cause the very overruns this is counting.
+			printf("T%c %u/%u/%u o%u\n",
+			       win_tof_on ? '+' : '-',
+			       win_rd_min, win_rd_sum / win_ticks, win_rd_max,
+			       overrun_total);
+
+			// A/B toggle off: ToF stays on so age reflects its real update rate.
+
+			win_rd_min = UINT32_MAX; win_rd_max = 0; win_rd_sum = 0;
+			win_inf_min = UINT32_MAX; win_inf_max = 0; win_inf_sum = 0;
+			win_ticks = 0;
+		}
+
 		//print some debug info every 100 ticks (0.5s) alternating between attitude and ToF
 		if (tick % 100 == 0) {
 			if (rc != 0) {
 				printf("t=%u read failed\n", tick);
-			} else if ((tick / 100) % 2 == 0) {
-				printf("t=%u R %+.1f/%+.1f P %+.1f/%+.1f deg rd=%uus inf=%uus\n",
-				       tick,
-				       (double)(att.roll * 57.2958f), (double)(att.roll_accel * 57.2958f),
-				       (double)(att.pitch * 57.2958f), (double)(att.pitch_accel * 57.2958f),
-				       read_time, infer_time);
 			} else {
-				printf("t=%u H %.3f/%.3f V %+.2f/%+.2f age=%dms\n",
-				       tick,
-				       (double)tof.height, (double)tof.height_raw,
+				printf("H %.3f V %+.2f/%+.2f a%d\n",
+				       (double)tof.height,
 				       (double)tof.vz, (double)tof.vz_raw,
 				       (int)(k_uptime_get() - tof.timestamp));
 			}
@@ -295,8 +331,9 @@ int main(void)
 		uint32_t elapsed = k_timer_status_sync(&loop_timer);
 
 		// if more than 1 tick has passed it means the work is too long for 5ms
-		if (elapsed>1){
+		if (elapsed > 1) {
 			uint32_t missed = elapsed - 1;
+			overrun_total += missed;
 			printf("OVERRUN at t=%u: missed %u tick(s)\n", tick, missed);
 		}
 	}

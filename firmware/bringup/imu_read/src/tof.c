@@ -18,6 +18,17 @@
 static struct tof_sample tof_shared;
 static K_MUTEX_DEFINE(tof_lock);
 
+// Lets the timing test turn ranging off so IMU read times can be compared with
+// and without ToF traffic on the shared bus. Checked at the top of the thread
+// loop, never mid-fetch: suspending the thread while it holds the I2C lock
+// would deadlock the control loop's MPU reads.
+static volatile bool tof_enabled = true;
+
+void tof_set_enabled(bool on)
+{
+	tof_enabled = on;
+}
+
 void tof_get_latest(struct tof_sample *out)
 {
 	k_mutex_lock(&tof_lock, K_FOREVER);
@@ -55,6 +66,12 @@ static void tof_thread_fn(void *p1, void *p2, void *p3)
 	bool filter_init = false;
 
 	while (1) {
+		// Checked here, between fetches, so we never stop mid-transaction.
+		if (!tof_enabled) {
+			k_sleep(K_MSEC(10));
+			continue;
+		}
+
 		// One ranging measurement. Blocks ~33ms but yields (k_sleep) internally,
 		// so the control loop keeps running throughout.
 		int ret = sensor_sample_fetch(tof);

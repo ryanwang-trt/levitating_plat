@@ -24,4 +24,8 @@ void tof_get_latest(struct tof_sample *out);
 // Return true if the sample is fresh enough to trust, false if it is stale.
 bool tof_sample_fresh(const struct tof_sample *s);
 
+// Turn ranging on/off at runtime. Used by the timing test to compare IMU read
+// times with and without ToF traffic on the shared I2C bus.
+void tof_set_enabled(bool on);
+
 #endif // TOF_H
