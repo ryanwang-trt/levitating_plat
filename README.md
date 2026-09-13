@@ -96,14 +96,14 @@ Each fine-tune stage runs at a much lower learning rate (3e-5) than the from-scr
 <td><img src="docs/LEVPLAT_TRAINING_STAGE2A_REW.png" width="400"/></td>
 </tr>
 <tr>
-<td colspan="2" align="center"><b>Stage 2a</b> — once disturbances are introduced, episode length stays high (~975–995 of 1000) through the fine-tune. Reward oscillates lower (−350 to −100) because grace shifts the reward's absolute scale — episode length and tip-over rate are the trustworthy signals here, not raw reward.</td>
+<td colspan="2" align="center"><b>Stage 2a</b> — once disturbances are introduced, episode length stays high (~975–995 of 1000) through the fine-tune. Reward oscillates lower (−350 to −100) because grace shifts the reward's absolute scale. </td>
 </tr>
 <tr>
 <td><img src="docs/LEVPLAT_TRAINING_STAGE2B_REW.png" width="400"/></td>
 <td></td>
 </tr>
 <tr>
-<td colspan="2" align="center"><b>Stage 2b (pre-fix)</b> — reward stays deeply negative (−450 to −190) with no clear upward trend, the visual signature of bug #4 above.</td>
+<td colspan="2" align="center"><b>Stage 2b</b> — reward stays deeply negative (−450 to −190). </td>
 </tr>
 </table>
 
