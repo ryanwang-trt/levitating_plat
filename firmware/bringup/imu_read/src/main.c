@@ -1,179 +1,22 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/i2c.h>
 #include <stdio.h>
 #include <math.h>
 
 #include "policy.h"
+#include "imu.h"
 #include "tof.h"
 #include "attitude.h"
 
 #define I2C_NODE DT_NODELABEL(i2c21)
 
 // Fixed control-loop rate. 200Hz -> 5ms period
-// Matching the sensor's SMPLRT_DIV=4 output rate set in mpu6050_init.
+// Matching the sensor's SMPLRT_DIV=4 output rate set in imu_init.
 #define CONTROL_HZ 200
 #define CONTROL_PERIOD K_MSEC(1000 / CONTROL_HZ)
 
 // Timing stats window: 400 ticks = 2s at 200Hz.
 #define WINDOW_TICKS 400
-
-#define MPU6050_ADDR 0x68
-
-// register map
-#define REG_SMPLRT_DIV 0x19   // sample rate = base_rate / (1 + SMPLRT_DIV)
-#define REG_CONFIG 0x1A   // bits2:0 DLPF_CFG (digital low-pass filter)
-#define REG_PWR_MGMT_1 0x6B   // bit6 SLEEP; bits2:0 CLKSEL (clock source)
-#define REG_GYRO_CONFIG 0x1B   // bits4:3 select gyro full-scale range
-#define REG_ACCEL_CONFIG 0x1C   // bits4:3 select accel full-scale range
-#define REG_ACCEL_XOUT_H 0x3B   // first of 14 big-endian bytes:
-                               // AX AY AZ TEMP GX GY GZ (2 bytes each)
-
-//Full-scale select values
-#define GYRO_FS_250DPS  (0 << 3)   // +/-250 deg/s
-#define ACCEL_FS_2G     (0 << 3)   // +/-2 g
-
-/* Scale factors for the ranges above (LSB per unit), from the datasheet:
-     accel +/-2 g -> 16384 LSB/g
-     gyro +/-250 -> 131.0 LSB/(deg/s)
-   Temperature: degC = raw/340 + 36.53 */
-#define ACCEL_LSB_PER_G 16384.0f
-#define GYRO_LSB_PER_DPS 131.0f
-
-// Per-sensor bias, measured at boot by calibrate(). Zero until then, so the
-// calibration reads see raw values. gyro_bias in dps, accel_offset in g.
-static float gyro_bias[3] = {0.0f, 0.0f, 0.0f};
-static float accel_offset[3] = {0.0f, 0.0f, 0.0f};
-
-// I/O helpers (return 0 on success)
-static int reg_write(const struct device *dev, uint8_t reg, uint8_t val)
-{
-	return i2c_reg_write_byte(dev, MPU6050_ADDR, reg, val);
-}
-
-static int burst_read(const struct device *dev, uint8_t start,
-		      uint8_t *buf, uint32_t len)
-{
-	return i2c_burst_read(dev, MPU6050_ADDR, start, buf, len);
-}
-
-/* Combine a big-endian (high byte first) register pair into a signed 16-bit
-   value. The MPU-6050 outputs are two's-complement, MSB at the lower address. */
-static int16_t be16(const uint8_t *p)
-{
-	return (int16_t)((p[0] << 8) | p[1]);
-}
-
-//Configure the sensor. Return 0 if every write succeeded.
-static int mpu6050_init(const struct device *dev)
-{
-	//Wake up MPU6050 and clock it from the gyro-X PLL (CLKSEL=1), a more
-	//stable timebase than the internal 8MHz oscillator (CLKSEL=0)
-	int ret = reg_write(dev, REG_PWR_MGMT_1, 0x01);
-	if (ret) {
-		return ret;   //return non 0 on fail writes
-	}
-
-	//DLPF_CFG=3: ~44Hz low-pass anti-aliasing filter. Also drops the gyro
-	//base output rate to 1kHz, which SMPLRT_DIV below divides down
-	ret = reg_write(dev, REG_CONFIG, 0x03);
-	if (ret) {
-		return ret;
-	}
-
-	//Sample rate = 1kHz / (1 + 4) = 200Hz. Depends on DLPF being enabled above
-	ret = reg_write(dev, REG_SMPLRT_DIV, 0x04);
-	if (ret) {
-		return ret;
-	}
-
-	//Set gyro mearsure range (FS_SEL = 00, therefore low gain)
-	ret = reg_write(dev, REG_GYRO_CONFIG, GYRO_FS_250DPS);
-	if (ret) {
-		return ret;
-	}
-
-	//Set accelometer range as above
-	ret = reg_write(dev, REG_ACCEL_CONFIG, ACCEL_FS_2G);
-
-	//Return 0 if all ret has value 0 (succeeded writes)
-	return ret;
-}
-
-//read one sample set and convert to physical units.
-//write results through the out-pointers, return 0 on success.
-static int read_sample(const struct device *dev,
-		       float accel_g[3], float gyro_dps[3], float *temp_c)
-{
-	uint8_t raw[14];
-	//reading reg contents into a raw array
-	int ret = burst_read(dev,REG_ACCEL_XOUT_H,raw,sizeof(raw));
-	if (ret) {
-		return ret;
-	}
-
-	//combine higher and lower bits into 16 bits values
-	int16_t ax=be16(&raw[0]);
-	int16_t ay=be16(&raw[2]);
-	int16_t az=be16(&raw[4]);
-
-	int16_t temp=be16(&raw[6]);
-
-	int16_t gyroX=be16(&raw[8]);
-	int16_t gyroY=be16(&raw[10]);
-	int16_t gyroZ=be16(&raw[12]);
-
-	// Scale to physical units, then subtract the per-sensor bias measured at boot.
-	accel_g[0] = ax/ACCEL_LSB_PER_G - accel_offset[0];
-	accel_g[1] = ay/ACCEL_LSB_PER_G - accel_offset[1];
-	accel_g[2] = az/ACCEL_LSB_PER_G - accel_offset[2];
-
-	gyro_dps[0] = gyroX/GYRO_LSB_PER_DPS - gyro_bias[0];
-	gyro_dps[1] = gyroY/GYRO_LSB_PER_DPS - gyro_bias[1];
-	gyro_dps[2] = gyroZ/GYRO_LSB_PER_DPS - gyro_bias[2];
-
-	*temp_c = temp/ 340.0f + 36.53f;
-
-	return 0;
-}
-
-// Measure per-sensor bias by averaging N samples while the board is held STILL
-// and LEVEL to subtract from future mearsurement
-static void calibrate(const struct device *dev)
-{
-	const int samples = 200;   // ~1s at 200Hz
-	float accel_sum[3] = {0.0f, 0.0f, 0.0f};
-	float gyro_sum[3] = {0.0f, 0.0f, 0.0f};
-	int valid = 0;
-
-	for (int n = 0; n < samples; n++) {
-		float a[3], g[3], t;
-		if (read_sample(dev, a, g, &t) == 0) {   // biases are still 0 -> raw
-			for (int i = 0; i < 3; i++) {
-				accel_sum[i] += a[i];
-				gyro_sum[i] += g[i];
-			}
-			valid++;
-		}
-		k_sleep(K_MSEC(5));
-	}
-
-	if (valid == 0) {
-		printf("calibrate: no valid samples, biases left at 0\n");
-		return;
-	}
-
-	for (int i = 0; i < 3; i++) {
-		gyro_bias[i] = gyro_sum[i] / valid;
-		accel_offset[i] = accel_sum[i] / valid;
-	}
-	accel_offset[2] -= 1.0f;   // level rest reads +1g on Z; the excess is the offset
-
-	printf("calibrated: gyro_bias=[% .2f % .2f % .2f]dps  "
-	       "accel_offset=[% .3f % .3f % .3f]g\n",
-	       (double)gyro_bias[0], (double)gyro_bias[1], (double)gyro_bias[2],
-	       (double)accel_offset[0], (double)accel_offset[1], (double)accel_offset[2]);
-}
 
 #define TARGET_HEIGHT_M 0.5f   // sim hover target (env.target_height)
 #define DEG2RAD (3.14159265f / 180.0f)
@@ -219,7 +62,7 @@ int main(void)
 		return -ENODEV;
 	}
 
-	if (mpu6050_init(i2c) != 0) {
+	if (imu_init(i2c) != 0) {
 		printf("ERROR: sensor init failed\n");
 		return -EIO;
 	}
@@ -237,7 +80,7 @@ int main(void)
 
 	// Measure sensor bias before flying. Board must sit still and level.
 	printf("calibrating -- hold still & level...\n");
-	calibrate(i2c);
+	imu_calibrate(i2c);
 
 	// Start the pacing timer: first tick one period from now, then every period.
 	k_timer_start(&loop_timer, CONTROL_PERIOD, CONTROL_PERIOD);
@@ -255,11 +98,11 @@ int main(void)
 	bool win_tof_on = true;
 
 	while (1) {
-		//buffers for accelometer, gyroscope and temperature datas
-		float accel_g[3], gyro_dps[3], temp_c;
+		//buffer for accelometer, gyroscope and temperature datas
+		struct imu_sample imu;
 
 		uint32_t start = k_cycle_get_32();
-		int rc = read_sample(i2c, accel_g, gyro_dps, &temp_c);
+		int rc = imu_read(i2c, &imu);
 		uint32_t end = k_cycle_get_32();
 
 		//Get the read duration for later engineering choices. (total time = 5ms)
@@ -271,7 +114,7 @@ int main(void)
 
 		// Run the complementary filter every tick
 		struct attitude att;
-		attitude_update(accel_g, gyro_dps, 1.0f / CONTROL_HZ, &att);
+		attitude_update(imu.accel_g, imu.gyro_dps, 1.0f / CONTROL_HZ, &att);
 
 		// edge detection for when tof sample is STALE or RECOVERED
 		// print the message only when the state changes 
@@ -280,7 +123,7 @@ int main(void)
 
 		// assemble the obs, run the policy, time the inference.
 		float obs[6], action[4];
-		build_obs(&att, &tof, gyro_dps, obs);
+		build_obs(&att, &tof, imu.gyro_dps, obs);
 
 		uint32_t infer_start = k_cycle_get_32();
 		policy_forward(obs, action);
